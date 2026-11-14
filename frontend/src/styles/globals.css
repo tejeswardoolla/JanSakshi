@@ -1,0 +1,146 @@
+@import "tailwindcss";
+
+/* ─────────────────────────────────────────────
+   JanSakshi Design Tokens
+───────────────────────────────────────────── */
+:root {
+  --color-navy:   #102B4E;
+  --color-orange: #F36B21;
+  --color-green:  #138A4B;
+  --color-white:  #FFFFFF;
+  --color-black:  #08090B;
+  --color-grey:   #F1F2F3;
+  --color-grey-mid: #9CA3AF;
+
+  --font-display: 'Inter', system-ui, sans-serif;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out:   cubic-bezier(0.76, 0, 0.24, 1);
+}
+
+/* ─── Reset ─────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  background: var(--color-black);
+  color: var(--color-white);
+  font-family: var(--font-display);
+  overflow-x: hidden;
+}
+
+/* ─── Typography Scale ───────────────────────── */
+.text-display {
+  font-size: clamp(3rem, 8vw, 7.5rem);
+  font-weight: 800;
+  line-height: 1.0;
+  letter-spacing: -0.03em;
+}
+
+.text-heading {
+  font-size: clamp(2rem, 5vw, 4rem);
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.text-subheading {
+  font-size: clamp(1rem, 2vw, 1.25rem);
+  font-weight: 400;
+  line-height: 1.6;
+}
+
+/* ─── Orange streak keyframes ─────────────────── */
+@keyframes streak-h {
+  0%   { transform: translateX(-120%) skewX(-15deg); opacity: 0; }
+  20%  { opacity: 1; }
+  80%  { opacity: 1; }
+  100% { transform: translateX(220%) skewX(-15deg); opacity: 0; }
+}
+
+@keyframes streak-v {
+  0%   { transform: translateY(-150%); opacity: 0; }
+  20%  { opacity: 0.7; }
+  80%  { opacity: 0.7; }
+  100% { transform: translateY(250%); opacity: 0; }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50%       { transform: translateY(-12px); }
+}
+
+@keyframes scan-line {
+  0%   { transform: translateY(0%); opacity: 0.6; }
+  100% { transform: translateY(100%); opacity: 0; }
+}
+
+@keyframes pulse-ring {
+  0%   { transform: scale(1);    opacity: 0.5; }
+  100% { transform: scale(1.6);  opacity: 0; }
+}
+
+@keyframes dot-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.2; }
+}
+
+.streak-h { animation: streak-h 3s var(--ease-in-out) infinite; }
+.streak-v { animation: streak-v 4s var(--ease-in-out) infinite; }
+.floating { animation: float 5s ease-in-out infinite; }
+.scan-line { animation: scan-line 2s linear infinite; }
+.pulse-ring { animation: pulse-ring 2s ease-out infinite; }
+.dot-blink  { animation: dot-blink 1.4s ease infinite; }
+
+/* ─── Scrollbar ──────────────────────────────── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--color-black); }
+::-webkit-scrollbar-thumb { background: var(--color-orange); border-radius: 2px; }
+
+/* ─── Reduced motion ─────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}
+
+/* ─────────────────────────────────────────────
+   JanSakshi Staff & Authority Portal Design System
+   Dark Glassmorphism, Frosted Translucent Panels, Saffron Accents
+───────────────────────────────────────────── */
+.staff-portal {
+  background-color: #090B10;
+  color: #F5F5F5;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+.staff-card {
+  background: rgba(20, 23, 34, 0.85);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 4px 24px -2px rgba(0, 0, 0, 0.4), 0 2px 6px -1px rgba(0, 0, 0, 0.2);
+}
+
+.staff-card-hover {
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.staff-card-hover:hover {
+  background: rgba(25, 29, 42, 0.95);
+  border-color: rgba(243, 107, 33, 0.3);
+  box-shadow: 0 10px 32px -4px rgba(0, 0, 0, 0.6), 0 4px 12px -2px rgba(243, 107, 33, 0.1);
+  transform: translateY(-2px);
+}
+
+.staff-glass-floating {
+  background: rgba(16, 19, 28, 0.85);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 12px 36px -6px rgba(0, 0, 0, 0.6);
+}
+
+

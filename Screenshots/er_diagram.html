@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            background-color: #0E1017;
+            color: #FFFFFF;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+            margin: 0;
+        }
+        h1 {
+            color: #F36B21;
+            font-size: 24px;
+            margin-bottom: 20px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+        }
+        .mermaid {
+            background: #141722;
+            padding: 30px;
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+            max-width: 1360px;
+            overflow: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>JanSakshi — Relational Database Entity-Relationship (ER) Topology</h1>
+    <div class="mermaid">
+erDiagram
+    COMPLAINTS ||--o{ AI_ANALYSES : "analyzed_by"
+    COMPLAINTS ||--o{ AI_ANALYSES : "references"
+    COMPLAINTS ||--o{ COMPLAINT_EVENTS : "references"
+    COMPLAINTS ||--o{ COMPLAINT_EVENTS : "tracks_events"
+    COMPLAINTS ||--o{ DUPLICATE_MATCHES : "matched_as"
+    COMPLAINTS ||--o{ DUPLICATE_MATCHES : "references"
+    COMPLAINTS ||--o{ EMAIL_MESSAGES : "references"
+    COMPLAINTS ||--o{ EVIDENCE : "has_evidence"
+    COMPLAINTS ||--o{ EVIDENCE : "references"
+    COMPLAINTS ||--o{ RESOLUTION_SUBMISSIONS : "references"
+    COMPLAINTS ||--o{ RESOLUTION_SUBMISSIONS : "resolves"
+    DEPARTMENTS ||--o{ COMPLAINTS : "assigned_to"
+    DEPARTMENTS ||--o{ RESOLUTION_SUBMISSIONS : "references"
+    DEPARTMENTS ||--o{ USERS : "belongs_to"
+    DEPARTMENTS ||--o{ USERS : "references"
+    EVIDENCE ||--o{ AI_ANALYSES : "references"
+    EVIDENCE ||--o{ RESOLUTION_SUBMISSIONS : "references"
+    PHYSICAL_ISSUES ||--o{ COMPLAINTS : "references"
+    PHYSICAL_ISSUES ||--o{ DUPLICATE_MATCHES : "clustered_in"
+    PHYSICAL_ISSUES ||--o{ DUPLICATE_MATCHES : "references"
+    RESOLUTION_SUBMISSIONS ||--o{ RESOLUTION_EVIDENCE_ANALYSES : "evaluated_by"
+    RESOLUTION_SUBMISSIONS ||--o{ RESOLUTION_EVIDENCE_ANALYSES : "references"
+    USERS ||--o{ RESOLUTION_SUBMISSIONS : "references"
+    AI_ANALYSES {
+        INTEGER id PK
+        VARCHAR_32 complaint_id
+        INTEGER evidence_id
+        VARCHAR_32 analysis_status
+        VARCHAR_64 predicted_category
+        FLOAT category_confidence
+        TEXT complaint_summary
+        TEXT visible_problem
+        VARCHAR_32 evidence_relevance
+        INTEGER relevance_score
+        VARCHAR_32 image_quality
+        INTEGER clarity_score
+        INTEGER visibility_score
+        BOOLEAN additional_evidence_required
+        VARCHAR_32 recommended_severity
+        FLOAT severity_confidence
+        TEXT reasoning
+        BOOLEAN human_review_required
+        TEXT review_reasons
+        VARCHAR_64 model_name
+        TEXT error_message
+        TEXT raw_response
+        DATETIME created_at
+        DATETIME updated_at
+    }
+    COMPLAINT_EVENTS {
+        INTEGER id PK
+        VARCHAR_32 complaint_id
+        VARCHAR_64 event_type
+        VARCHAR_255 previous_value
+        VARCHAR_255 new_value
+        TEXT description
+        VARCHAR_64 source
+        DATETIME created_at
+    }
+    COMPLAINTS {
+        INTEGER id PK
+        VARCHAR_32 complaint_id
+        VARCHAR_64 tracking_token
+        VARCHAR_64 category
+        TEXT description
+        FLOAT latitude
+        FLOAT longitude
+        FLOAT location_accuracy
+        VARCHAR_32 location_source
+        VARCHAR_512 google_maps_url
+        VARCHAR_128 citizen_name
+        VARCHAR_128 citizen_email
+        VARCHAR_32 citizen_phone
+        VARCHAR_32 submission_channel
+        VARCHAR_32 status
+        DATETIME created_at
+        DATETIME updated_at
+        VARCHAR_32 issue_id
+        VARCHAR_32 verification_status
+        DATETIME verified_at
+        INTEGER verified_by_user_id
+        VARCHAR_128 verified_by_name
+        TEXT rejection_reason
+        TEXT info_request_notes
+        INTEGER assigned_department_id
+        INTEGER assigned_to_user_id
+        DATETIME assigned_at
+        TEXT assignment_notes
+        VARCHAR_64 admin_status
+        TEXT status_notes
+        INTEGER escalation_level
+        TEXT escalation_reason
+        DATETIME escalated_at
+        VARCHAR_128 escalated_to
+        TEXT internal_notes
+    }
+    DEPARTMENTS {
+        INTEGER id PK
+        VARCHAR_128 name
+        VARCHAR_32 code
+        TEXT description
+        VARCHAR_128 head_name
+        VARCHAR_128 contact_email
+        INTEGER sla_days
+        BOOLEAN is_active
+        DATETIME created_at
+    }
+    DUPLICATE_MATCHES {
+        INTEGER id PK
+        VARCHAR_32 complaint_id
+        VARCHAR_32 candidate_physical_issue_id
+        FLOAT similarity_score
+        FLOAT gps_similarity
+        FLOAT gps_distance_meters
+        FLOAT text_similarity
+        FLOAT image_similarity
+        FLOAT category_similarity
+        VARCHAR_32 confidence_level
+        VARCHAR_64 recommendation
+        TEXT matching_explanation
+        TEXT warning_signals
+        VARCHAR_32 review_status
+        VARCHAR_128 reviewer_id
+        TEXT review_reason
+        DATETIME reviewed_at
+        DATETIME created_at
+        DATETIME updated_at
+    }
+    EMAIL_MESSAGES {
+        INTEGER id PK
+        VARCHAR_128 gmail_message_id
+        VARCHAR_128 gmail_thread_id
+        VARCHAR_255 sender_email
+        VARCHAR_255 sender_name
+        VARCHAR_512 subject
+        TEXT snippet
+        TEXT body_plain
+        TEXT body_html
+        DATETIME received_at
+        VARCHAR_32 processing_status
+        VARCHAR_32 complaint_id
+        BOOLEAN is_civic_complaint
+        VARCHAR_64 extracted_category
+        TEXT extracted_location_text
+        TEXT extracted_metadata
+        TEXT error_details
+        BOOLEAN has_attachments
+        INTEGER attachments_count
+        TEXT attachments_info
+        BOOLEAN acknowledgement_sent
+        DATETIME acknowledgement_sent_at
+        VARCHAR_128 acknowledgement_message_id
+        BOOLEAN is_follow_up
+        DATETIME created_at
+        DATETIME updated_at
+    }
+    EVIDENCE {
+        INTEGER id PK
+        VARCHAR_32 complaint_id
+        VARCHAR_255 original_filename
+        VARCHAR_255 stored_filename
+        VARCHAR_64 file_type
+        INTEGER file_size
+        VARCHAR_512 storage_path
+        DATETIME created_at
+    }
+    PHYSICAL_ISSUES {
+        INTEGER id PK
+        VARCHAR_32 issue_reference_id
+        VARCHAR_64 category
+        FLOAT representative_latitude
+        FLOAT representative_longitude
+        VARCHAR_255 representative_location
+        TEXT description
+        VARCHAR_32 current_status
+        DATETIME created_at
+        DATETIME updated_at
+    }
+    RESOLUTION_EVIDENCE_ANALYSES {
+        INTEGER id PK
+        INTEGER resolution_submission_id
+        VARCHAR_64 model_name
+        VARCHAR_32 evidence_relevance
+        VARCHAR_32 description_consistency
+        TEXT before_after_comparison
+        TEXT visual_observations
+        TEXT missing_evidence
+        VARCHAR_64 assessment
+        VARCHAR_32 analysis_status
+        TEXT error_message
+        TEXT raw_response
+        DATETIME created_at
+    }
+    RESOLUTION_SUBMISSIONS {
+        INTEGER id PK
+        VARCHAR_32 complaint_id
+        INTEGER department_id
+        INTEGER submitted_by_user_id
+        TEXT work_completed_description
+        TEXT repair_action_taken
+        DATETIME completion_datetime
+        TEXT field_notes
+        INTEGER before_evidence_id
+        INTEGER after_evidence_id
+        VARCHAR_255 additional_evidence_ids
+        INTEGER version_number
+        VARCHAR_32 status
+        TEXT authority_notes
+        INTEGER reviewed_by_user_id
+        DATETIME reviewed_at
+        DATETIME created_at
+        DATETIME updated_at
+    }
+    USERS {
+        INTEGER id PK
+        VARCHAR_64 username
+        VARCHAR_128 email
+        VARCHAR_255 hashed_password
+        VARCHAR_128 full_name
+        VARCHAR_32 role
+        INTEGER department_id
+        BOOLEAN is_active
+        DATETIME created_at
+        DATETIME last_login_at
+        VARCHAR_128 allowed_department_ids
+    }
+    </div>
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                primaryColor: '#1A1F2C',
+                primaryTextColor: '#FFFFFF',
+                primaryBorderColor: '#F36B21',
+                lineColor: '#F36B21',
+                secondaryColor: '#10131C',
+                tertiaryColor: '#0E1017'
+            }
+        });
+    </script>
+</body>
+</html>

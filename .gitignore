@@ -1,0 +1,118 @@
+# =============================================================================
+# JanSakshi Root Git Ignore File
+# Security directive: Absolutely NO credentials, private data, or citizen PII
+# =============================================================================
+
+# --- Environment & Secret Files (CRITICAL) ---
+.env
+.env.*
+*.env
+*.env.local
+*.env.*.local
+!*.env.example
+
+# --- Credentials, OAuth Tokens & Private JSON Files ---
+*.token.json
+*token*.json
+*credential*.json
+*secret*.json
+gmail_tokens.json
+gmail_credentials.json
+gmail_oauth_states.json
+storage/gmail_*.json
+backend/storage/gmail_*.json
+storage/*.json
+backend/storage/*.json
+
+# --- Databases & Persistent Storage ---
+*.db
+*.db*
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.*
+*.db.*backup
+*jansakshi*.db*
+*.sqlite
+*.sqlite3
+jansakshi.db
+backend/jansakshi.db
+backend/jansakshi.db*
+
+# --- Citizen Evidence & Uploaded Photographs ---
+storage/evidence/*
+!storage/evidence/.gitkeep
+backend/storage/evidence/*
+!backend/storage/evidence/.gitkeep
+uploads/
+backend/uploads/
+storage/temp/
+backend/storage/temp/
+
+# --- Python & Virtual Environments ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+env/
+ENV/
+backend/venv/
+backend/.venv/
+
+# --- Node & Frontend Build Artifacts ---
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+dist-ssr/
+frontend/dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- Editor & OS Files ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# --- Logs, Temporary Files & Template Extract Dumps ---
+*.log
+backend/*.log
+report_template_extracted/
+backend/report_template_extracted/
