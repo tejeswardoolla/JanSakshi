@@ -130,3 +130,5 @@ desktop.ini
 backend/*.log
 report_template_extracted/
 backend/report_template_extracted/
+scratch/
+backend/scratch/
