@@ -48,7 +48,7 @@ export default function AuthorityOfficerDashboardView({ data, loading, onRefresh
   useEffect(() => {
     const loadDepartments = async () => {
       try {
-        const res = await authFetch('http://127.0.0.1:8000/api/authority/departments')
+        const res = await authFetch('/api/authority/departments')
         if (res.ok) {
           const json = await res.json()
           if (json.departments && json.departments.length > 0) {
@@ -92,7 +92,7 @@ export default function AuthorityOfficerDashboardView({ data, loading, onRefresh
     setActionSuccess(null)
     setActionError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaint.complaint_id}/verify`, {
+      const res = await authFetch(`/api/authority/complaints/${complaint.complaint_id}/verify`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: 'Civic verification approved for municipal departmental action.' })
@@ -121,7 +121,7 @@ export default function AuthorityOfficerDashboardView({ data, loading, onRefresh
     setActionSuccess(null)
     setActionError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${selectedComplaint.complaint_id}/reject`, {
+      const res = await authFetch(`/api/authority/complaints/${selectedComplaint.complaint_id}/reject`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: rejectionReason.trim() })
@@ -167,7 +167,7 @@ export default function AuthorityOfficerDashboardView({ data, loading, onRefresh
     setActionSuccess(null)
     setActionError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${selectedComplaint.complaint_id}/assign`, {
+      const res = await authFetch(`/api/authority/complaints/${selectedComplaint.complaint_id}/assign`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -205,7 +205,7 @@ export default function AuthorityOfficerDashboardView({ data, loading, onRefresh
     setActionSuccess(null)
     setActionError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaintId}/status`, {
+      const res = await authFetch(`/api/authority/complaints/${complaintId}/status`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -234,7 +234,7 @@ export default function AuthorityOfficerDashboardView({ data, loading, onRefresh
     setActionSuccess(null)
     setActionError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${selectedComplaint.complaint_id}/return-correction`, {
+      const res = await authFetch(`/api/authority/complaints/${selectedComplaint.complaint_id}/return-correction`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ correction_notes: returnNotes.trim() })

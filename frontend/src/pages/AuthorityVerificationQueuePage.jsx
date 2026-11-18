@@ -39,7 +39,7 @@ export default function AuthorityVerificationQueuePage() {
     setLoading(true)
     setError(null)
     try {
-      const res = await authFetch('http://127.0.0.1:8000/api/authority/complaints?verification_status=pending&limit=50')
+      const res = await authFetch('/api/authority/complaints?verification_status=pending&limit=50')
       if (!res.ok) throw new Error('Failed to load verification queue.')
       const data = await res.json()
       setComplaints(data.items || [])
@@ -53,7 +53,7 @@ export default function AuthorityVerificationQueuePage() {
   const handleVerify = async () => {
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${targetId}/verify`, {
+      const res = await authFetch(`/api/authority/complaints/${targetId}/verify`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: verifyNotes })
@@ -76,7 +76,7 @@ export default function AuthorityVerificationQueuePage() {
     }
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${targetId}/reject`, {
+      const res = await authFetch(`/api/authority/complaints/${targetId}/reject`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: rejectReason })
@@ -99,7 +99,7 @@ export default function AuthorityVerificationQueuePage() {
     }
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${targetId}/request-info`, {
+      const res = await authFetch(`/api/authority/complaints/${targetId}/request-info`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: infoNotes })

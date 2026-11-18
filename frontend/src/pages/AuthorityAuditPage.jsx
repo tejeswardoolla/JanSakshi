@@ -5,6 +5,7 @@ import {
   Shield, ExternalLink, ArrowRight
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
+import { getApiUrl } from '../config/api'
 import AuthorityLayout from '../components/AuthorityLayout'
 import { formatToIST, formatISTDateOnly } from '../utils/dateTime'
 
@@ -41,7 +42,7 @@ export default function AuthorityAuditPage() {
       if (eventType) params.append('event_type', eventType)
       if (isDeptOfficer) params.append('department_id', activeDeptId.toString())
 
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/audit?${params.toString()}`)
+      const res = await authFetch(getApiUrl(`/api/authority/audit?${params.toString()}`))
       if (!res.ok) throw new Error('Failed to load audit history.')
       const data = await res.json()
       setEvents(data.items || [])

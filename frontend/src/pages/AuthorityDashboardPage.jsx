@@ -56,8 +56,8 @@ export default function AuthorityDashboardPage() {
     setError(null)
     setIs403Forbidden(false)
     try {
-      let overviewUrl = 'http://127.0.0.1:8000/api/authority/overview'
-      let complaintsUrl = 'http://127.0.0.1:8000/api/authority/complaints?limit=50'
+      let overviewUrl = '/api/authority/overview'
+      let complaintsUrl = '/api/authority/complaints?limit=50'
 
       if (user?.role === 'department_officer') {
         const deptId = activeDept?.id || 1
@@ -92,7 +92,7 @@ export default function AuthorityDashboardPage() {
 
   // --- Actions Handlers ---
   const handleVerify = async (complaintId, notes) => {
-    const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaintId}/verify`, {
+    const res = await authFetch(`/api/authority/complaints/${complaintId}/verify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ notes })
@@ -102,7 +102,7 @@ export default function AuthorityDashboardPage() {
   }
 
   const handleReject = async (complaintId, reason) => {
-    const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaintId}/reject`, {
+    const res = await authFetch(`/api/authority/complaints/${complaintId}/reject`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reason })
@@ -112,7 +112,7 @@ export default function AuthorityDashboardPage() {
   }
 
   const handleRequestInfo = async (complaintId, notes) => {
-    const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaintId}/request-info`, {
+    const res = await authFetch(`/api/authority/complaints/${complaintId}/request-info`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ notes })
@@ -122,7 +122,7 @@ export default function AuthorityDashboardPage() {
   }
 
   const handleAssign = async (complaintId, departmentId) => {
-    const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaintId}/assign`, {
+    const res = await authFetch(`/api/authority/complaints/${complaintId}/assign`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ department_id: departmentId })
@@ -132,7 +132,7 @@ export default function AuthorityDashboardPage() {
   }
 
   const handleUpdateStatus = async (complaintId, status, notes) => {
-    const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaintId}/status`, {
+    const res = await authFetch(`/api/authority/complaints/${complaintId}/status`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status, notes })
@@ -142,7 +142,7 @@ export default function AuthorityDashboardPage() {
   }
 
   const handleAddNote = async (complaintId, notes) => {
-    const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaintId}/notes`, {
+    const res = await authFetch(`/api/authority/complaints/${complaintId}/notes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ notes })

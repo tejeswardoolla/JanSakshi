@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react'
+import { getApiUrl } from '../config/api'
 
 const AuthContext = createContext(null)
 
@@ -46,7 +47,7 @@ export function AuthProvider({ children }) {
   const login = async (username, password) => {
     setLoading(true)
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/auth/login', {
+      const res = await fetch(getApiUrl('/api/auth/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })
@@ -83,7 +84,7 @@ export function AuthProvider({ children }) {
     // Server-enforced revocation (fire-and-forget)
     if (curToken || curRefreshToken) {
       try {
-        fetch('http://127.0.0.1:8000/api/auth/logout', {
+        fetch(getApiUrl('/api/auth/logout'), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -110,7 +111,7 @@ export function AuthProvider({ children }) {
 
     isRefreshingRef.current = true
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/auth/refresh', {
+      const res = await fetch(getApiUrl('/api/auth/refresh'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ refresh_token: savedRefreshToken })
@@ -135,13 +136,14 @@ export function AuthProvider({ children }) {
   }
 
   const authFetch = async (url, options = {}) => {
+    const resolvedUrl = typeof url === 'string' ? getApiUrl(url) : url
     const currentToken = token || localStorage.getItem('jansakshi_authority_token')
     const headers = {
       ...(options.headers || {}),
       Authorization: currentToken ? `Bearer ${currentToken}` : ''
     }
 
-    const res = await fetch(url, { ...options, headers })
+    const res = await fetch(resolvedUrl, { ...options, headers })
 
     if (res.status === 401) {
       // Don't loop if the failing request was itself a login or refresh
@@ -154,7 +156,7 @@ export function AuthProvider({ children }) {
             ...(options.headers || {}),
             Authorization: `Bearer ${refreshedToken}`
           }
-          const retryRes = await fetch(url, { ...options, headers: retryHeaders })
+          const retryRes = await fetch(resolvedUrl, { ...options, headers: retryHeaders })
           if (retryRes.status !== 401) {
             return retryRes
           }

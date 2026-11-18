@@ -145,16 +145,111 @@ class GmailAuthService:
         return creds is not None and creds.valid
 
     @classmethod
+    def _load_token_from_db(cls) -> Optional[dict]:
+        """Loads OAuth token data dictionary from PostgreSQL database."""
+        try:
+            from app.database import SessionLocal
+            from app.models.oauth_token import OAuthToken
+            db = SessionLocal()
+            try:
+                row = db.query(OAuthToken).filter(
+                    OAuthToken.provider == "gmail",
+                    OAuthToken.account_email == GMAIL_INBOX_ADDRESS
+                ).first()
+                if row and row.token_data:
+                    return json.loads(row.token_data)
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug(f"Could not load OAuth token from database: {e}")
+        return None
+
+    @classmethod
+    def _save_token_to_db(cls, token_json_str: str) -> bool:
+        """Persists OAuth token securely to database for serverless resilience."""
+        try:
+            from app.database import SessionLocal
+            from app.models.oauth_token import OAuthToken
+            from app.core.config import utc_now
+            db = SessionLocal()
+            try:
+                row = db.query(OAuthToken).filter(
+                    OAuthToken.provider == "gmail",
+                    OAuthToken.account_email == GMAIL_INBOX_ADDRESS
+                ).first()
+                if not row:
+                    row = OAuthToken(
+                        provider="gmail",
+                        account_email=GMAIL_INBOX_ADDRESS,
+                        token_data=token_json_str
+                    )
+                    db.add(row)
+                else:
+                    row.token_data = token_json_str
+                    row.updated_at = utc_now()
+                db.commit()
+                return True
+            except Exception as e:
+                db.rollback()
+                logger.error(f"Failed to persist OAuth token to database: {e}")
+                return False
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"Database error while saving OAuth token: {e}")
+            return False
+
+    @classmethod
+    def _delete_token_from_db(cls) -> bool:
+        """Removes OAuth token from database."""
+        try:
+            from app.database import SessionLocal
+            from app.models.oauth_token import OAuthToken
+            db = SessionLocal()
+            try:
+                db.query(OAuthToken).filter(
+                    OAuthToken.provider == "gmail",
+                    OAuthToken.account_email == GMAIL_INBOX_ADDRESS
+                ).delete()
+                db.commit()
+                return True
+            except Exception as e:
+                db.rollback()
+                logger.error(f"Failed to remove OAuth token from database: {e}")
+                return False
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"Database error while removing OAuth token: {e}")
+            return False
+
+    @classmethod
     def get_credentials(cls) -> Optional[Credentials]:
-        """Loads and auto-refreshes Google OAuth credentials from token file after validating scopes."""
-        if not os.path.exists(GMAIL_TOKEN_PATH):
+        """
+        Loads and auto-refreshes Google OAuth credentials from database or local token file.
+        Database is preferred for serverless durability across instances.
+        """
+        token_data = None
+        source = None
+
+        # 1. Try PostgreSQL database first
+        db_data = cls._load_token_from_db()
+        if db_data:
+            token_data = db_data
+            source = "database"
+        elif os.path.exists(GMAIL_TOKEN_PATH):
+            # 2. Fall back to local filesystem file
+            try:
+                with open(GMAIL_TOKEN_PATH, "r", encoding="utf-8") as f:
+                    token_data = json.load(f)
+                source = "file"
+            except Exception as e:
+                logger.warning(f"Failed reading token file {GMAIL_TOKEN_PATH}: {e}")
+
+        if not token_data:
             return None
 
         try:
-            # Inspect stored token scopes to ensure outdated permissions (like gmail.modify) are not reused
-            with open(GMAIL_TOKEN_PATH, "r", encoding="utf-8") as f:
-                token_data = json.load(f)
-            
             stored_scopes = set(token_data.get("scopes", []))
             required_scopes = set(GMAIL_SCOPES)
             
@@ -166,23 +261,37 @@ class GmailAuthService:
                 )
                 return None
 
-            creds = Credentials.from_authorized_user_file(GMAIL_TOKEN_PATH, GMAIL_SCOPES)
+            creds = Credentials.from_authorized_user_info(token_data, GMAIL_SCOPES)
             if creds and creds.expired and creds.refresh_token:
-                logger.info("Gmail OAuth token expired; auto-refreshing via refresh_token...")
+                logger.info(f"Gmail OAuth token expired; auto-refreshing via refresh_token ({source})...")
                 creds.refresh(Request())
                 cls.save_credentials(creds)
+            elif creds and source == "file":
+                # Auto-sync token from file into database for serverless persistence
+                cls._save_token_to_db(creds.to_json())
+
             return creds if creds and creds.valid else None
         except Exception as e:
-            logger.warning(f"Failed to load or refresh Gmail credentials from {GMAIL_TOKEN_PATH}: {e}")
+            logger.warning(f"Failed to load or refresh Gmail credentials from {source}: {e}")
             return None
 
     @classmethod
     def save_credentials(cls, creds: Credentials) -> None:
-        """Securely writes credentials to the token path."""
-        os.makedirs(os.path.dirname(os.path.abspath(GMAIL_TOKEN_PATH)), exist_ok=True)
-        with open(GMAIL_TOKEN_PATH, "w", encoding="utf-8") as token_file:
-            token_file.write(creds.to_json())
-        logger.info(f"Gmail credentials saved to {GMAIL_TOKEN_PATH}")
+        """Securely writes credentials to both PostgreSQL database and local token file."""
+        json_str = creds.to_json()
+
+        # 1. Save to PostgreSQL database for serverless durability
+        cls._save_token_to_db(json_str)
+
+        # 2. Save to local filesystem if writable
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(GMAIL_TOKEN_PATH)), exist_ok=True)
+            with open(GMAIL_TOKEN_PATH, "w", encoding="utf-8") as token_file:
+                token_file.write(json_str)
+        except Exception as e:
+            logger.debug(f"Could not write local token file (expected in read-only serverless): {e}")
+
+        logger.info("Gmail credentials securely saved to persistent store.")
 
     @classmethod
     def consume_oauth_state(cls, state: Optional[str]) -> Optional[str]:
@@ -303,16 +412,17 @@ class GmailAuthService:
 
     @classmethod
     def disconnect(cls) -> bool:
-        """Removes local token file safely to disconnect mailbox."""
+        """Removes token safely from both database and local store to disconnect mailbox."""
+        db_removed = cls._delete_token_from_db()
+        file_removed = True
         if os.path.exists(GMAIL_TOKEN_PATH):
             try:
                 os.remove(GMAIL_TOKEN_PATH)
-                logger.info("Gmail tokens removed.")
-                return True
             except Exception as e:
-                logger.error(f"Failed removing tokens: {e}")
-                return False
-        return True
+                logger.error(f"Failed removing local token file: {e}")
+                file_removed = False
+        logger.info("Gmail credentials disconnected.")
+        return db_removed or file_removed
 
     @classmethod
     def get_status(cls) -> Dict[str, Any]:

@@ -23,7 +23,21 @@ from app.core.config import utc_now
 logger = logging.getLogger("jansakshi.security")
 
 # Secret key and algorithm for JWT
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "jansakshi-authority-super-secure-key-2026-phase7")
+DEFAULT_INSECURE_SECRET = "jansakshi-authority-super-secure-key-2026-phase7"
+_env_secret = os.getenv("JWT_SECRET_KEY", "").strip()
+_app_env = os.getenv("APP_ENV", "development").strip().lower()
+
+if _app_env == "production":
+    if not _env_secret or _env_secret == DEFAULT_INSECURE_SECRET:
+        raise RuntimeError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: A strong, unique JWT_SECRET_KEY "
+            "must be configured in environment variables for production deployments. "
+            "Refusing to boot with empty or insecure default secret."
+        )
+    SECRET_KEY = _env_secret
+else:
+    SECRET_KEY = _env_secret or DEFAULT_INSECURE_SECRET
+
 ALGORITHM = "HS256"
 
 # -----------------------------------------------------------------------------

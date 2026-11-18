@@ -51,7 +51,7 @@ export default function AuthorityComplaintsPage() {
 
   const fetchDepartments = async () => {
     try {
-      const res = await authFetch('http://127.0.0.1:8000/api/authority/departments')
+      const res = await authFetch('/api/authority/departments')
       if (res.ok) {
         const json = await res.json()
         setDepartments(json.departments || [])
@@ -83,7 +83,7 @@ export default function AuthorityComplaintsPage() {
         params.append('department_id', departmentId)
       }
 
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints?${params.toString()}`)
+      const res = await authFetch(`/api/authority/complaints?${params.toString()}`)
       if (!res.ok) {
         throw new Error('Failed to load complaint records.')
       }

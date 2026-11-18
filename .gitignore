@@ -44,10 +44,24 @@ storage/evidence/*
 !storage/evidence/.gitkeep
 backend/storage/evidence/*
 !backend/storage/evidence/.gitkeep
+storage/evidence_backup*/
+backend/storage/evidence_backup*/
+Images/
 uploads/
 backend/uploads/
 storage/temp/
 backend/storage/temp/
+
+# --- Local Demo Scripts & Previews ---
+Screenshots/demo_*.png
+Screenshots/email_preview_*
+Screenshots/01_demo_authority_detail.png
+backend/submit_demo_*.py
+backend/verify_demo_*.py
+backend/execute_safe_demo_cleanup.py
+backend/verify_post_cleanup.py
+backend/render_screenshot.py
+backend/send_demo_acknowledgement.py
 
 # --- Python & Virtual Environments ---
 __pycache__/

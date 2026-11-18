@@ -10,6 +10,7 @@ import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { useAuth } from '../../context/AuthContext'
+import { getApiUrl } from '../../config/api'
 import AuthorityLayout from '../../components/AuthorityLayout'
 import { formatToIST, formatISTDateOnly, formatISTTimeOnly } from '../../utils/dateTime'
 import { resolveDepartment, saveDepartmentContext } from '../../utils/departmentContext'
@@ -72,7 +73,7 @@ export default function DepartmentWorkOrderDetailPage() {
     setError(null)
     setForbidden(false)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}`)
+      const res = await authFetch(`/api/authority/complaints/${id}`)
       if (res.status === 403) {
         const errJson = await res.json().catch(() => ({}))
         setForbidden(true)
@@ -112,7 +113,7 @@ export default function DepartmentWorkOrderDetailPage() {
       const statusToApply = statusOverride || targetStatus
       const notesToApply = notesOverride !== undefined ? notesOverride : statusNotes
 
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/status`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/status`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -144,7 +145,7 @@ export default function DepartmentWorkOrderDetailPage() {
     setActionLoading(true)
     setActionSuccess(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/notes`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/notes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: newInspectionNote.trim() })
@@ -183,7 +184,7 @@ export default function DepartmentWorkOrderDetailPage() {
         formData.append('caption', evidenceCaption.trim())
       }
 
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/evidence`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/evidence`, {
         method: 'POST',
         body: formData
       })
@@ -236,7 +237,7 @@ export default function DepartmentWorkOrderDetailPage() {
         field_notes: resFieldNotes.trim(),
         after_photo_urls: resAfterPhotoUrl ? [resAfterPhotoUrl.trim()] : []
       }
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaint.complaint_id}/resolution/submit`, {
+      const res = await authFetch(`/api/authority/complaints/${complaint.complaint_id}/resolution/submit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -566,7 +567,7 @@ export default function DepartmentWorkOrderDetailPage() {
                       className="group relative rounded-2xl overflow-hidden bg-[#10131C] border border-white/[0.08] hover:border-[#F36B21]/50 transition-all cursor-pointer shadow-xs aspect-video flex flex-col justify-end"
                     >
                       <img
-                        src={`http://127.0.0.1:8000${ev.view_url}`}
+                        src={getApiUrl(ev.view_url)}
                         alt={ev.original_filename}
                         className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                         onError={(e) => {
@@ -997,7 +998,7 @@ export default function DepartmentWorkOrderDetailPage() {
             </div>
             <div className="p-4 bg-black/50 flex items-center justify-center max-h-[75vh] overflow-hidden">
               <img
-                src={`http://127.0.0.1:8000${selectedEvidenceView.view_url}`}
+                src={getApiUrl(selectedEvidenceView.view_url)}
                 alt={selectedEvidenceView.original_filename}
                 className="max-h-[70vh] w-auto object-contain rounded-xl"
               />

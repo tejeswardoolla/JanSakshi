@@ -32,7 +32,7 @@ export default function AdminDashboardView({ data, loading, onRefresh }) {
     setActionSuccess(null)
     setActionError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaintId}/mark-ready`, {
+      const res = await authFetch(`/api/authority/complaints/${complaintId}/mark-ready`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: 'Admin completed AI, location and duplicate review.' })

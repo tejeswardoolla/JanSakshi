@@ -29,11 +29,11 @@ export default function AuthorityDepartmentsPage() {
     setError(null)
     try {
       const deptUrl = isDeptOfficer
-        ? `http://127.0.0.1:8000/api/authority/departments?department_id=${activeDeptId}`
-        : 'http://127.0.0.1:8000/api/authority/departments'
+        ? `/api/authority/departments?department_id=${activeDeptId}`
+        : '/api/authority/departments'
       const overUrl = isDeptOfficer
-        ? `http://127.0.0.1:8000/api/authority/overview?department_id=${activeDeptId}`
-        : 'http://127.0.0.1:8000/api/authority/overview'
+        ? `/api/authority/overview?department_id=${activeDeptId}`
+        : '/api/authority/overview'
 
       const [deptRes, overRes] = await Promise.all([
         authFetch(deptUrl),

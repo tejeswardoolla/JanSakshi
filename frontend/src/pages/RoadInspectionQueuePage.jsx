@@ -39,8 +39,8 @@ export default function RoadInspectionQueuePage() {
     setError(null)
     try {
       const url = activeDeptId
-        ? `http://127.0.0.1:8000/api/authority/inspection-queue?department_id=${activeDeptId}`
-        : 'http://127.0.0.1:8000/api/authority/inspection-queue'
+        ? `/api/authority/inspection-queue?department_id=${activeDeptId}`
+        : '/api/authority/inspection-queue'
       const res = await authFetch(url)
       if (!res.ok) throw new Error('Failed to load field inspection queue.')
       const data = await res.json()
@@ -57,7 +57,7 @@ export default function RoadInspectionQueuePage() {
     setActionLoading(true)
     setActionSuccess(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${complaintId}/status`, {
+      const res = await authFetch(`/api/authority/complaints/${complaintId}/status`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -84,7 +84,7 @@ export default function RoadInspectionQueuePage() {
     if (!inspectionNotes.trim() || !selectedComplaint) return
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${selectedComplaint.complaint_id}/notes`, {
+      const res = await authFetch(`/api/authority/complaints/${selectedComplaint.complaint_id}/notes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -112,7 +112,7 @@ export default function RoadInspectionQueuePage() {
     if (!selectedComplaint) return
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${selectedComplaint.complaint_id}/status`, {
+      const res = await authFetch(`/api/authority/complaints/${selectedComplaint.complaint_id}/status`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -150,7 +150,7 @@ export default function RoadInspectionQueuePage() {
         formData.append('caption', evidenceCaption)
       }
 
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${selectedComplaint.complaint_id}/evidence`, {
+      const res = await authFetch(`/api/authority/complaints/${selectedComplaint.complaint_id}/evidence`, {
         method: 'POST',
         body: formData
       })

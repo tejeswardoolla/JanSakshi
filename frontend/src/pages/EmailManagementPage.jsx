@@ -333,7 +333,7 @@ export default function EmailManagementPage() {
                     </ul>
                   </li>
                   <li>Create Credentials &rarr; <strong>OAuth 2.0 Client ID</strong> &rarr; Application type: <em>Web application</em>.</li>
-                  <li>Add Authorized redirect URI: <code className="bg-black/40 px-1 py-0.5 rounded text-[#F36B21]">http://localhost:8000/api/email/oauth/callback</code></li>
+                  <li>Add Authorized redirect URI: <code className="bg-black/40 px-1 py-0.5 rounded text-[#F36B21]">https://your-domain/api/email/oauth/callback</code> (or <code className="bg-black/40 px-1 py-0.5 rounded text-[#F36B21]">http://localhost:8000/api/email/oauth/callback</code> for local testing).</li>
                   <li>Add <code className="bg-black/40 px-1 py-0.5 rounded">GMAIL_CLIENT_ID</code> and <code className="bg-black/40 px-1 py-0.5 rounded">GMAIL_CLIENT_SECRET</code> to <code className="bg-black/40 px-1 py-0.5 rounded">backend/.env</code>.</li>
                   <li>Click <em>Connect Gmail Account</em> below and log in as <strong className="text-white font-mono">jansakshiofficial@gmail.com</strong>.</li>
                 </ol>

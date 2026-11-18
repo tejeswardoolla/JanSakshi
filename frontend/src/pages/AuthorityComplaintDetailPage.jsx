@@ -7,6 +7,7 @@ import {
   Lock, MessageSquare, HelpCircle, Layers, Wrench
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
+import { getApiUrl } from '../config/api'
 import AuthorityLayout from '../components/AuthorityLayout'
 import DepartmentWorkOrderDetailPage from './authority/DepartmentWorkOrderDetailPage'
 import { formatToIST, formatISTDateOnly, formatISTTimeOnly } from '../utils/dateTime'
@@ -57,7 +58,7 @@ export default function AuthorityComplaintDetailPage() {
     setLoading(true)
     setError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}`)
+      const res = await authFetch(`/api/authority/complaints/${id}`)
       if (!res.ok) {
         throw new Error(`Failed to load complaint ${id}.`)
       }
@@ -76,7 +77,7 @@ export default function AuthorityComplaintDetailPage() {
 
   const fetchDepartments = async () => {
     try {
-      const res = await authFetch('http://127.0.0.1:8000/api/authority/departments')
+      const res = await authFetch('/api/authority/departments')
       if (res.ok) {
         const json = await res.json()
         setDepartments(json.departments || [])
@@ -91,7 +92,7 @@ export default function AuthorityComplaintDetailPage() {
     setActionLoading(true)
     setActionSuccess(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/verify`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/verify`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: verifyNotes })
@@ -113,7 +114,7 @@ export default function AuthorityComplaintDetailPage() {
   const handleMarkReady = async () => {
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/mark-ready`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/mark-ready`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: 'Admin completed review and marked ready for Authority Officer.' })
@@ -135,7 +136,7 @@ export default function AuthorityComplaintDetailPage() {
     }
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/reject`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/reject`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: rejectReason })
@@ -161,7 +162,7 @@ export default function AuthorityComplaintDetailPage() {
     }
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/request-info`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/request-info`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: infoNotes })
@@ -187,7 +188,7 @@ export default function AuthorityComplaintDetailPage() {
     }
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/assign`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/assign`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -214,7 +215,7 @@ export default function AuthorityComplaintDetailPage() {
     if (!targetStatus) return
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/status`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/status`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -243,7 +244,7 @@ export default function AuthorityComplaintDetailPage() {
     }
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/escalate`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/escalate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -270,7 +271,7 @@ export default function AuthorityComplaintDetailPage() {
     if (!newInternalNote.trim()) return
     setActionLoading(true)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/complaints/${id}/notes`, {
+      const res = await authFetch(`/api/authority/complaints/${id}/notes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: newInternalNote })
@@ -543,7 +544,7 @@ export default function AuthorityComplaintDetailPage() {
                           <video
                             controls
                             className="w-full h-48 object-cover rounded-lg bg-black"
-                            src={`http://127.0.0.1:8000${ev.view_url}`}
+                            src={getApiUrl(ev.view_url)}
                           />
                         </div>
                       ) : (
@@ -552,7 +553,7 @@ export default function AuthorityComplaintDetailPage() {
                           onClick={() => setSelectedEvidenceView(ev)}
                         >
                           <img
-                            src={`http://127.0.0.1:8000${ev.view_url}`}
+                            src={getApiUrl(ev.view_url)}
                             alt={ev.original_filename}
                             className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                           />
@@ -1294,7 +1295,7 @@ export default function AuthorityComplaintDetailPage() {
             </div>
             <div className="p-3 overflow-auto flex items-center justify-center max-h-[75vh]">
               <img
-                src={`http://127.0.0.1:8000${selectedEvidenceView.view_url}`}
+                src={getApiUrl(selectedEvidenceView.view_url)}
                 alt={selectedEvidenceView.original_filename}
                 className="max-h-full max-w-full object-contain rounded-2xl"
               />

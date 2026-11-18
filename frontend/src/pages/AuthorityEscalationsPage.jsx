@@ -22,7 +22,7 @@ export default function AuthorityEscalationsPage() {
     setLoading(true)
     setError(null)
     try {
-      const res = await authFetch('http://127.0.0.1:8000/api/authority/complaints?escalation_level=1&limit=50')
+      const res = await authFetch('/api/authority/complaints?escalation_level=1&limit=50')
       if (!res.ok) throw new Error('Failed to load escalations.')
       const data = await res.json()
       setComplaints(data.items || [])

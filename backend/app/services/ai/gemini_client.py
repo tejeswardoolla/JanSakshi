@@ -51,21 +51,28 @@ class GeminiClient:
         if not self.is_configured:
             raise RuntimeError("Gemini API key is not configured or client initialization failed.")
 
+        from io import BytesIO
+        from app.services.storage_service import get_evidence_content
+
+        pil_image = None
+        image_loaded = False
+        if image_path:
+            try:
+                raw_bytes = get_evidence_content(image_path)
+                pil_image = Image.open(BytesIO(raw_bytes))
+                image_loaded = True
+            except Exception as img_err:
+                logger.warning(f"Could not load image evidence from {image_path}: {img_err}")
+
         prompt = build_complaint_analysis_prompt(
             category=category,
             description=description,
-            has_image=bool(image_path and os.path.exists(image_path))
+            has_image=image_loaded
         )
 
         contents = []
-
-        # If image evidence is present and valid, load it using PIL
-        if image_path and os.path.exists(image_path):
-            try:
-                pil_image = Image.open(image_path)
-                contents.append(pil_image)
-            except Exception as img_err:
-                logger.warning(f"Could not load image evidence at {image_path}: {img_err}")
+        if image_loaded and pil_image:
+            contents.append(pil_image)
 
         contents.append(prompt)
 

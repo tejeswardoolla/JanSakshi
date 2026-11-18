@@ -20,8 +20,28 @@ from app.schemas import (
     PhysicalIssueResponse,
     DuplicateMatchResponse,
 )
+from pydantic import BaseModel
+
+class DirectUploadTokenRequest(BaseModel):
+    filename: str
+    content_type: str
+    file_size: int
 
 router = APIRouter(prefix="/api/complaints", tags=["Complaints"])
+
+@router.post("/evidence/upload-token")
+async def get_direct_upload_token(payload: DirectUploadTokenRequest):
+    """
+    Direct Browser-to-Blob Upload Token Endpoint.
+    Enables secure direct media uploads to Vercel Blob up to 25 MB,
+    bypassing the Vercel Hobby 4.5 MB request body limit.
+    """
+    from app.services.storage_service import prepare_direct_upload
+    return prepare_direct_upload(
+        filename=payload.filename,
+        content_type=payload.content_type,
+        file_size=payload.file_size
+    )
 
 @router.post("/resolve-location", response_model=LocationResolveResponse)
 async def resolve_location(payload: LocationResolveRequest):

@@ -47,7 +47,7 @@ export default function AuthorityEquityIntelligencePage() {
     setLoading(true)
     setError(null)
     try {
-      let url = `http://127.0.0.1:8000/api/authority/equity/overview?days=${timeWindow}`
+      let url = `/api/authority/equity/overview?days=${timeWindow}`
       if (deptFilter) {
         url += `&department_id=${deptFilter}`
       }

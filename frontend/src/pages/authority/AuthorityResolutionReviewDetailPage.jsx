@@ -30,7 +30,7 @@ export default function AuthorityResolutionReviewDetailPage() {
     setLoading(true)
     setError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/resolutions/${id}`)
+      const res = await authFetch(`/api/authority/resolutions/${id}`)
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}))
         throw new Error(errJson.detail || 'Failed to load resolution dossier.')
@@ -53,7 +53,7 @@ export default function AuthorityResolutionReviewDetailPage() {
     setActionLoading(true)
     setActionError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/resolutions/${id}/approve`, {
+      const res = await authFetch(`/api/authority/resolutions/${id}/approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -82,7 +82,7 @@ export default function AuthorityResolutionReviewDetailPage() {
     setActionLoading(true)
     setActionError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/resolutions/${id}/return`, {
+      const res = await authFetch(`/api/authority/resolutions/${id}/return`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -111,7 +111,7 @@ export default function AuthorityResolutionReviewDetailPage() {
     setActionLoading(true)
     setActionError(null)
     try {
-      const res = await authFetch(`http://127.0.0.1:8000/api/authority/resolutions/${id}/request-evidence`, {
+      const res = await authFetch(`/api/authority/resolutions/${id}/request-evidence`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

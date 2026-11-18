@@ -9,6 +9,10 @@ from app.services.email.email_intent_classifier import (
     DecisionType,
     ClassificationResult
 )
+from app.services.email.email_templates import (
+    render_acknowledgement_email_html,
+    render_acknowledgement_email_text
+)
 
 __all__ = [
     "GmailAuthService",
@@ -21,5 +25,6 @@ __all__ = [
     "EmailIntentClassifier",
     "DecisionType",
     "ClassificationResult",
+    "render_acknowledgement_email_html",
+    "render_acknowledgement_email_text",
 ]
-

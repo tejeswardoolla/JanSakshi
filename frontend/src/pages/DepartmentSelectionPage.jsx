@@ -91,7 +91,7 @@ export default function DepartmentSelectionPage() {
     setLoading(true)
     setError(null)
     try {
-      const res = await authFetch('http://127.0.0.1:8000/api/authority/departments/selection')
+      const res = await authFetch('/api/authority/departments/selection')
       if (!res.ok) throw new Error('Failed to load department selection data.')
       const json = await res.json()
       setDepartments(json.departments || [])

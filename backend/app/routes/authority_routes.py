@@ -95,7 +95,7 @@ async def get_authority_overview(
         authorized_ids = current_user.get_authorized_department_ids()
         if not authorized_ids:
             raise HTTPException(status_code=403, detail="Department officer not assigned to any municipal department.")
-        
+
         if department_id is not None:
             if department_id not in authorized_ids:
                 raise HTTPException(
@@ -122,9 +122,9 @@ async def get_authority_overview(
     verified_complaints = sum(1 for c in all_complaints if c.verification_status == "verified")
     rejected_complaints = sum(1 for c in all_complaints if c.verification_status == "rejected")
     info_requested_complaints = sum(1 for c in all_complaints if c.verification_status == "info_requested")
-    
+
     awaiting_assignment = sum(
-        1 for c in all_complaints 
+        1 for c in all_complaints
         if c.verification_status == "verified" and c.assigned_department_id is None and c.admin_status not in ("Resolved", "Rejected")
     )
     in_progress = sum(1 for c in all_complaints if c.admin_status in ("In Progress", "Assigned"))
@@ -142,7 +142,7 @@ async def get_authority_overview(
     # Role 2 (Authority Officer) Specific Operational KPIs
     # Strictly Admin-prepared, intake-complete grievances awaiting authoritative civic decision
     awaiting_decision = sum(
-        1 for c in all_complaints 
+        1 for c in all_complaints
         if c.admin_status == "Ready for Authority Officer" and c.verification_status == "pending" and c.latitude is not None and c.longitude is not None
     )
     active_work_orders = sum(1 for c in all_complaints if c.admin_status in ("Assigned", "In Progress", "Under Inspection", "Resolution Submitted"))
@@ -157,7 +157,7 @@ async def get_authority_overview(
     for c in all_complaints:
         cat = c.category or "Uncategorized"
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
-    
+
     category_distribution = [
         {
             "category": cat,
@@ -172,7 +172,7 @@ async def get_authority_overview(
     for c in all_complaints:
         st = c.admin_status or c.status or "Received"
         status_counts[st] = status_counts.get(st, 0) + 1
-    
+
     status_distribution = [
         {"status": st, "count": count}
         for st, count in sorted(status_counts.items(), key=lambda x: x[1], reverse=True)
@@ -220,11 +220,11 @@ async def get_authority_overview(
     for c in all_complaints:
         if c.admin_status in ("Resolved", "Rejected"):
             continue
-        
+
         is_escalated = (c.escalation_level or 0) > 0
         latest_ai = c.ai_analyses[0] if c.ai_analyses else None
         severity = latest_ai.recommended_severity if latest_ai else "Medium"
-        
+
         # Calculate age in hours
         created_time = c.created_at
         if created_time.tzinfo is None:
@@ -519,7 +519,7 @@ async def list_authority_complaints(
     items = []
     for c in complaints_page:
         latest_ai = c.ai_analyses[0] if c.ai_analyses else None
-        
+
         # Check severity filter in python if specified
         ai_sev = latest_ai.recommended_severity if latest_ai else "Medium"
         if severity and ai_sev.lower() != severity.lower():
@@ -1295,7 +1295,7 @@ async def add_internal_note(
 
     timestamp_str = utc_now().strftime("%Y-%m-%d %H:%M UTC")
     new_entry = f"[{timestamp_str}] {current_user.full_name} ({current_user.role}): {payload.notes.strip()}"
-    
+
     if c.internal_notes:
         c.internal_notes = f"{c.internal_notes}\n\n{new_entry}"
     else:
@@ -1371,7 +1371,7 @@ async def list_departments(
         authorized_ids = current_user.get_authorized_department_ids()
         if not authorized_ids:
             raise HTTPException(status_code=403, detail="Department officer not assigned to any municipal department.")
-        
+
         if department_id is not None:
             if department_id not in authorized_ids:
                 raise HTTPException(
@@ -1399,7 +1399,7 @@ async def list_departments(
         pending_inspections = sum(1 for c in dept_complaints if c.admin_status in ("Assigned", "Pending Inspection") and c.verification_status == "verified")
         in_progress_repairs = sum(1 for c in dept_complaints if c.admin_status == "In Progress")
         resolved_complaints = sum(1 for c in dept_complaints if c.admin_status == "Resolved" or c.status == "Resolved")
-        
+
         # Calculate overdue work orders (> sla_days)
         overdue_work_orders = 0
         sla_hours = d.sla_days * 24
@@ -1538,12 +1538,20 @@ async def get_evidence_file(
     stored_filename: str,
     db: Session = Depends(get_db)
 ):
-    """Stream evidence photo or video securely."""
+    """Stream evidence photo or video securely from local storage or Vercel Blob."""
     clean_name = os.path.basename(stored_filename.strip())
     ev = db.query(Evidence).filter(Evidence.stored_filename == clean_name).first()
-    if not ev or not os.path.exists(ev.storage_path):
+    if not ev:
+        raise HTTPException(status_code=404, detail="Evidence record not found.")
+
+    # If evidence is hosted in Vercel Blob, redirect directly to secure Blob URL
+    if ev.storage_path.startswith("http://") or ev.storage_path.startswith("https://"):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=ev.storage_path)
+
+    if not os.path.exists(ev.storage_path):
         raise HTTPException(status_code=404, detail="Evidence file not found on disk.")
-    
+
     return FileResponse(
         path=ev.storage_path,
         media_type=ev.file_type,
@@ -1571,7 +1579,7 @@ async def get_road_inspection_queue(
         authorized_ids = current_user.get_authorized_department_ids()
         if not authorized_ids:
             raise HTTPException(status_code=403, detail="Department officer is not associated with any department.")
-        
+
         if department_id is not None:
             if department_id not in authorized_ids:
                 raise HTTPException(
@@ -1585,10 +1593,10 @@ async def get_road_inspection_queue(
         query = query.filter(Complaint.assigned_department_id == target_dept_id)
     elif department_id is not None:
         query = query.filter(Complaint.assigned_department_id == department_id)
-    
+
     # Needs field inspection / repair (not resolved or rejected)
     query = query.filter(Complaint.admin_status.in_(["Assigned", "In Progress", "Pending Inspection"]))
-    
+
     complaints = query.order_by(Complaint.created_at.desc()).all()
 
     items = []

@@ -10,8 +10,8 @@ import { useAuth } from '../context/AuthContext'
 export default function AuthorityLoginPage() {
   const [searchParams] = useSearchParams()
   const sessionExpired = searchParams.get('session_expired') === 'true'
-  const [username, setUsername] = useState('officer')
-  const [password, setPassword] = useState('JanSakshi@2026')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState(null)
   const [demoExpanded, setDemoExpanded] = useState(false)
@@ -44,14 +44,12 @@ export default function AuthorityLoginPage() {
   const fillCredentials = (accountType) => {
     if (accountType === 'admin') {
       setUsername('admin')
-      setPassword('JanSakshi@2026')
     } else if (accountType === 'officer') {
       setUsername('officer')
-      setPassword('JanSakshi@2026')
     } else if (accountType === 'dept_demo') {
       setUsername('dept_demo')
-      setPassword('JanSakshi@2026')
     }
+    setPassword('')
     setError(null)
   }
 
@@ -266,108 +264,110 @@ export default function AuthorityLoginPage() {
               </button>
             </form>
 
-            {/* Collapsible Hackathon Demo Access (Collapsed by Default) */}
-            <div className="pt-4 border-t border-white/[0.08]">
-              <button
-                type="button"
-                onClick={() => setDemoExpanded(!demoExpanded)}
-                className="w-full flex items-center justify-between text-xs font-semibold text-[#A1A1AA] hover:text-[#F5F5F5] transition-colors py-1 cursor-pointer"
-              >
-                <span className="flex items-center gap-1.5 uppercase tracking-wider text-[11px]">
-                  <Sparkles className="w-3.5 h-3.5 text-[#F36B21]" />
-                  Hackathon Demo Access
-                </span>
-                {demoExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-              </button>
+            {/* Collapsible Hackathon Demo Access (Development Mode Only) */}
+            {import.meta.env.DEV && (
+              <div className="pt-4 border-t border-white/[0.08]">
+                <button
+                  type="button"
+                  onClick={() => setDemoExpanded(!demoExpanded)}
+                  className="w-full flex items-center justify-between text-xs font-semibold text-[#A1A1AA] hover:text-[#F5F5F5] transition-colors py-1 cursor-pointer"
+                >
+                  <span className="flex items-center gap-1.5 uppercase tracking-wider text-[11px]">
+                    <Sparkles className="w-3.5 h-3.5 text-[#F36B21]" />
+                    Hackathon Demo Access
+                  </span>
+                  {demoExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                </button>
 
-              {demoExpanded && (
-                <div className="mt-3 space-y-2">
-                  {/* Option 1: Admin */}
-                  <div
-                    onClick={() => fillCredentials('admin')}
-                    className={`p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between ${
-                      username === 'admin'
-                        ? 'bg-[#191D2A] text-white border-[#F36B21]/50 shadow-sm'
-                        : 'bg-[#10131C] hover:bg-[#191D2A]/60 text-[#A1A1AA] border-white/[0.08]'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <div className="w-8 h-8 rounded-xl bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400 flex-shrink-0">
-                        <Cpu className="w-4 h-4" />
-                      </div>
-                      <div>
-                        <div className="text-xs font-bold text-[#F5F5F5] flex items-center gap-1.5">
-                          <span>Admin</span>
-                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white/[0.08] text-[#A1A1AA]">
-                            admin
-                          </span>
+                {demoExpanded && (
+                  <div className="mt-3 space-y-2">
+                    {/* Option 1: Admin */}
+                    <div
+                      onClick={() => fillCredentials('admin')}
+                      className={`p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between ${
+                        username === 'admin'
+                          ? 'bg-[#191D2A] text-white border-[#F36B21]/50 shadow-sm'
+                          : 'bg-[#10131C] hover:bg-[#191D2A]/60 text-[#A1A1AA] border-white/[0.08]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-8 h-8 rounded-xl bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400 flex-shrink-0">
+                          <Cpu className="w-4 h-4" />
                         </div>
-                        <div className="text-[11px] text-[#A1A1AA]">
-                          AI & Complaint Management
+                        <div>
+                          <div className="text-xs font-bold text-[#F5F5F5] flex items-center gap-1.5">
+                            <span>Admin</span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white/[0.08] text-[#A1A1AA]">
+                              admin
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-[#A1A1AA]">
+                            AI & Complaint Management
+                          </div>
                         </div>
                       </div>
+                      {username === 'admin' && <CheckCircle className="w-4 h-4 text-[#F36B21]" />}
                     </div>
-                    {username === 'admin' && <CheckCircle className="w-4 h-4 text-[#F36B21]" />}
-                  </div>
 
-                  {/* Option 2: Authority Officer */}
-                  <div
-                    onClick={() => fillCredentials('officer')}
-                    className={`p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between ${
-                      username === 'officer'
-                        ? 'bg-[#191D2A] text-white border-[#F36B21]/50 shadow-sm'
-                        : 'bg-[#10131C] hover:bg-[#191D2A]/60 text-[#A1A1AA] border-white/[0.08]'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <div className="w-8 h-8 rounded-xl bg-[#F36B21]/10 border border-[#F36B21]/20 flex items-center justify-center text-[#F36B21] flex-shrink-0">
-                        <CheckCircle2 className="w-4 h-4" />
-                      </div>
-                      <div>
-                        <div className="text-xs font-bold text-[#F5F5F5] flex items-center gap-1.5">
-                          <span>Authority Officer</span>
-                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white/[0.08] text-[#A1A1AA]">
-                            officer
-                          </span>
+                    {/* Option 2: Authority Officer */}
+                    <div
+                      onClick={() => fillCredentials('officer')}
+                      className={`p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between ${
+                        username === 'officer'
+                          ? 'bg-[#191D2A] text-white border-[#F36B21]/50 shadow-sm'
+                          : 'bg-[#10131C] hover:bg-[#191D2A]/60 text-[#A1A1AA] border-white/[0.08]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-8 h-8 rounded-xl bg-[#F36B21]/10 border border-[#F36B21]/20 flex items-center justify-center text-[#F36B21] flex-shrink-0">
+                          <CheckCircle2 className="w-4 h-4" />
                         </div>
-                        <div className="text-[11px] text-[#A1A1AA]">
-                          Decisions & Department Assignment
+                        <div>
+                          <div className="text-xs font-bold text-[#F5F5F5] flex items-center gap-1.5">
+                            <span>Authority Officer</span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white/[0.08] text-[#A1A1AA]">
+                              officer
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-[#A1A1AA]">
+                            Decisions & Department Assignment
+                          </div>
                         </div>
                       </div>
+                      {username === 'officer' && <CheckCircle className="w-4 h-4 text-[#F36B21]" />}
                     </div>
-                    {username === 'officer' && <CheckCircle className="w-4 h-4 text-[#F36B21]" />}
-                  </div>
 
-                  {/* Option 3: Department Officer */}
-                  <div
-                    onClick={() => fillCredentials('dept_demo')}
-                    className={`p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between ${
-                      username === 'dept_demo'
-                        ? 'bg-[#191D2A] text-white border-[#F36B21]/50 shadow-sm'
-                        : 'bg-[#10131C] hover:bg-[#191D2A]/60 text-[#A1A1AA] border-white/[0.08]'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <div className="w-8 h-8 rounded-xl bg-sky-500/10 border border-sky-500/20 flex items-center justify-center text-sky-400 flex-shrink-0">
-                        <Wrench className="w-4 h-4" />
-                      </div>
-                      <div>
-                        <div className="text-xs font-bold text-[#F5F5F5] flex items-center gap-1.5">
-                          <span>Department Officer</span>
-                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white/[0.08] text-[#A1A1AA]">
-                            dept_demo
-                          </span>
+                    {/* Option 3: Department Officer */}
+                    <div
+                      onClick={() => fillCredentials('dept_demo')}
+                      className={`p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between ${
+                        username === 'dept_demo'
+                          ? 'bg-[#191D2A] text-white border-[#F36B21]/50 shadow-sm'
+                          : 'bg-[#10131C] hover:bg-[#191D2A]/60 text-[#A1A1AA] border-white/[0.08]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-8 h-8 rounded-xl bg-sky-500/10 border border-sky-500/20 flex items-center justify-center text-sky-400 flex-shrink-0">
+                          <Wrench className="w-4 h-4" />
                         </div>
-                        <div className="text-[11px] text-[#A1A1AA]">
-                          All Six Department Workspaces
+                        <div>
+                          <div className="text-xs font-bold text-[#F5F5F5] flex items-center gap-1.5">
+                            <span>Department Officer</span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white/[0.08] text-[#A1A1AA]">
+                              dept_demo
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-[#A1A1AA]">
+                            All Six Department Workspaces
+                          </div>
                         </div>
                       </div>
+                      {username === 'dept_demo' && <CheckCircle className="w-4 h-4 text-[#F36B21]" />}
                     </div>
-                    {username === 'dept_demo' && <CheckCircle className="w-4 h-4 text-[#F36B21]" />}
                   </div>
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Return link to Citizen Portal */}

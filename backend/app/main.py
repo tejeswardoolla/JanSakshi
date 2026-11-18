@@ -3,9 +3,11 @@ JanSakshi – AI-Powered Public Complaint Verification and Accountability System
 FastAPI Backend – Phase 6 Gmail AI Integration & Unified Email Complaint Processing
 """
 
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect
 
 from app.database import Base, engine
 import app.models  # Ensures all models (PhysicalIssue, Complaint, Evidence, ComplaintEvent, AIAnalysis, DuplicateMatch, EmailMessage, Department, User) register
@@ -13,12 +15,33 @@ from app.routes import (
     complaints, ai_routes, issues, duplicates, email_routes,
     auth_routes, authority_routes, resolution_routes
 )
-from app.core.config import ALLOWED_ORIGINS
+from app.core.config import ALLOWED_ORIGINS, APP_ENV
+
+logger = logging.getLogger("jansakshi.lifecycle")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ensure database schema is up-to-date on startup
-    Base.metadata.create_all(bind=engine)
+    # Inspect database schema on startup to verify deployment readiness
+    try:
+        inspector = inspect(engine)
+        existing_tables = set(inspector.get_table_names())
+        dialect_name = engine.dialect.name
+
+        if APP_ENV == "production":
+            required_tables = {"complaints", "departments", "users", "evidence", "complaint_events"}
+            missing_tables = required_tables - existing_tables
+            if missing_tables:
+                logger.warning(
+                    f"[DATABASE WARNING] Production {dialect_name} database is missing core tables: {missing_tables}. "
+                    f"Applying non-destructive Base.metadata.create_all(). Run migration script to import historical data."
+                )
+            else:
+                logger.info(
+                    f"[DATABASE] Verified production {dialect_name} database schema with {len(existing_tables)} tables."
+                )
+        Base.metadata.create_all(bind=engine)
+    except Exception as db_err:
+        logger.error(f"[DATABASE ERROR] Startup database verification failed: {db_err}")
     yield
 
 app = FastAPI(
