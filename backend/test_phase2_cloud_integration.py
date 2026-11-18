@@ -86,13 +86,13 @@ def run_tests():
         "departments", "users", "revoked_tokens", "physical_issues",
         "complaints", "evidence", "complaint_events", "ai_analyses",
         "duplicate_matches", "email_messages", "resolution_submissions",
-        "resolution_evidence_analyses", "oauth_tokens"
+        "resolution_evidence_analyses", "oauth_tokens", "oauth_states"
     }
     actual_tables = set(Base.metadata.tables.keys())
     missing_tables = expected_tables - actual_tables
     assert_test(
         len(missing_tables) == 0,
-        "All 13 Core Database Tables Defined in ORM",
+        "All 14 Core Database Tables Defined in ORM",
         f"Missing: {missing_tables if missing_tables else 'None'}"
     )
 

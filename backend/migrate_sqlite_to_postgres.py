@@ -43,6 +43,7 @@ TABLE_ORDER = [
     "resolution_submissions",
     "resolution_evidence_analyses",
     "oauth_tokens",
+    "oauth_states",
 ]
 
 # Tables with serial sequence columns to reset
@@ -58,6 +59,7 @@ SEQUENCE_TABLES = [
     ("resolution_submissions", "id"),
     ("resolution_evidence_analyses", "id"),
     ("oauth_tokens", "id"),
+    ("oauth_states", "id"),
 ]
 
 def parse_args():

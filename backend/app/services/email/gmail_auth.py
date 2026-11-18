@@ -1,5 +1,6 @@
 import os
 import time
+import datetime
 import json
 import secrets
 import hashlib
@@ -7,12 +8,16 @@ import base64
 import logging
 import threading
 from typing import Optional, Dict, Any, Tuple
+from sqlalchemy.orm import Session
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
+from app.database import SessionLocal
+from app.models.oauth_state import OAuthState
 from app.core.config import (
+    utc_now,
     GMAIL_ENABLED,
     GMAIL_INBOX_ADDRESS,
     GMAIL_CLIENT_ID,
@@ -29,67 +34,200 @@ logger = logging.getLogger("jansakshi.gmail.auth")
 
 class OAuthStateManager:
     """
-    Thread-safe and persistent store for OAuth 2.0 PKCE code verifiers and state tokens.
-    Prevents CSRF, enforces TTL expiration (15 min), and guarantees single-use consumption.
+    Thread-safe, serverless-ready persistent store for OAuth 2.0 PKCE code verifiers and state tokens.
+    Persists to PostgreSQL (OAuthState table) for cross-instance serverless coordination on Vercel.
+    Retains local JSON state storage as a secondary fallback for local development.
+    Guarantees atomic single-use consumption, TTL expiration, and replay protection.
+    Never logs or exposes sensitive state tokens or code verifier secrets.
     """
     _lock = threading.Lock()
 
     @classmethod
-    def _load_states(cls) -> Dict[str, Dict[str, Any]]:
+    def _save_to_local_json(cls, state: str, code_verifier: str, expires_at_timestamp: float) -> None:
+        """Fallback: stores state in local JSON file for development environments."""
+        try:
+            with cls._lock:
+                now = time.time()
+                states = cls._load_local_json()
+                valid_states = {s: v for s, v in states.items() if v.get("expires_at", 0) > now}
+                valid_states[state] = {
+                    "code_verifier": code_verifier,
+                    "expires_at": expires_at_timestamp
+                }
+                os.makedirs(os.path.dirname(os.path.abspath(GMAIL_OAUTH_STATE_PATH)), exist_ok=True)
+                with open(GMAIL_OAUTH_STATE_PATH, "w", encoding="utf-8") as f:
+                    json.dump(valid_states, f)
+        except Exception as e:
+            logger.debug(f"Could not write local OAuth state JSON (expected in read-only serverless): {e}")
+
+    @classmethod
+    def _load_local_json(cls) -> Dict[str, Dict[str, Any]]:
+        """Reads local JSON store if present."""
         if not os.path.exists(GMAIL_OAUTH_STATE_PATH):
             return {}
         try:
             with open(GMAIL_OAUTH_STATE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"Could not read OAuth state store: {e}")
+            logger.debug(f"Could not read local OAuth state JSON: {e}")
             return {}
 
     @classmethod
-    def _save_states(cls, states: Dict[str, Dict[str, Any]]) -> None:
+    def _consume_from_local_json(cls, state: str) -> Optional[str]:
+        """Consumes code_verifier from local JSON fallback."""
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(GMAIL_OAUTH_STATE_PATH)), exist_ok=True)
-            with open(GMAIL_OAUTH_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump(states, f)
+            with cls._lock:
+                now = time.time()
+                states = cls._load_local_json()
+                entry = states.pop(state, None)
+                valid_states = {s: v for s, v in states.items() if v.get("expires_at", 0) > now}
+                try:
+                    with open(GMAIL_OAUTH_STATE_PATH, "w", encoding="utf-8") as f:
+                        json.dump(valid_states, f)
+                except Exception:
+                    pass
+
+                if entry and entry.get("expires_at", 0) >= now:
+                    return entry.get("code_verifier")
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def cleanup_expired_states(cls, db: Optional[Session] = None) -> int:
+        """Safely cleans expired OAuth states from the database without touching valid states."""
+        own_session = False
+        if db is None:
+            db = SessionLocal()
+            own_session = True
+        try:
+            now = utc_now()
+            deleted_count = db.query(OAuthState).filter(OAuthState.expires_at < now).delete(synchronize_session=False)
+            db.commit()
+            return deleted_count
         except Exception as e:
-            logger.error(f"Could not save OAuth states: {e}")
+            db.rollback()
+            logger.warning(f"Could not clean expired OAuth states: {e}")
+            return 0
+        finally:
+            if own_session:
+                db.close()
 
     @classmethod
-    def store(cls, state: str, code_verifier: str, ttl_seconds: int = 900) -> None:
-        """Saves a state -> code_verifier mapping with expiration."""
-        with cls._lock:
-            now = time.time()
-            states = cls._load_states()
-            # Prune expired states
-            valid_states = {s: v for s, v in states.items() if v.get("expires_at", 0) > now}
-            valid_states[state] = {
-                "code_verifier": code_verifier,
-                "expires_at": now + ttl_seconds,
-            }
-            cls._save_states(valid_states)
-
-    @classmethod
-    def consume(cls, state: Optional[str]) -> Optional[str]:
+    def store(cls, state: str, code_verifier: str, ttl_seconds: int = 900, db: Optional[Session] = None) -> None:
         """
-        Atomically validates, retrieves, and deletes the code_verifier for the given state.
-        Returns code_verifier if valid and unexpired; None otherwise.
+        Securely stores OAuth state and PKCE verifier in PostgreSQL database.
+        Also writes to local JSON store for local development environments.
+        Never logs or exposes the state token or code verifier value.
+        """
+        if not state or not code_verifier:
+            raise ValueError("State and code_verifier are required.")
+
+        now = utc_now()
+        expires_at = now + datetime.timedelta(seconds=ttl_seconds)
+
+        # 1. Primary Store: Database (PostgreSQL / SQLite)
+        own_session = False
+        if db is None:
+            db = SessionLocal()
+            own_session = True
+        try:
+            # Clean expired states periodically on insert
+            cls.cleanup_expired_states(db)
+
+            # Ensure any duplicate state entry is removed (prevent conflicts)
+            db.query(OAuthState).filter(OAuthState.state_token == state).delete(synchronize_session=False)
+
+            oauth_state_record = OAuthState(
+                state_token=state,
+                code_verifier=code_verifier,
+                expires_at=expires_at,
+                created_at=now,
+                is_consumed=False,
+                consumed_at=None
+            )
+            db.add(oauth_state_record)
+            db.commit()
+            logger.info("OAuth state successfully persisted to database with %ds TTL.", ttl_seconds)
+        except Exception as db_err:
+            db.rollback()
+            logger.error(f"Failed to persist OAuth state to database: {db_err}")
+            raise
+        finally:
+            if own_session:
+                db.close()
+
+        # 2. Secondary Local JSON Store (Development fallback)
+        cls._save_to_local_json(state, code_verifier, time.time() + ttl_seconds)
+
+    @classmethod
+    def consume(cls, state: Optional[str], db: Optional[Session] = None) -> Optional[str]:
+        """
+        Atomically validates, retrieves, and marks the code_verifier for the given state as consumed.
+        Enforces single-use consumption and expiration.
+        Rejects already-consumed (replayed), expired, or invalid states.
+        Never logs the actual state or verifier strings.
         """
         if not state:
+            logger.warning("OAuth state verification failed: Empty state parameter.")
             return None
-        with cls._lock:
-            now = time.time()
-            states = cls._load_states()
-            entry = states.pop(state, None)
-            valid_states = {s: v for s, v in states.items() if v.get("expires_at", 0) > now}
-            cls._save_states(valid_states)
 
-            if not entry:
-                logger.warning("OAuth state verification failed: state token not found.")
-                return None
-            if entry.get("expires_at", 0) < now:
-                logger.warning("OAuth state verification failed: session expired.")
-                return None
-            return entry.get("code_verifier")
+        now = utc_now()
+
+        # 1. Primary Verification: Database (Atomic single-use consumption)
+        own_session = False
+        if db is None:
+            db = SessionLocal()
+            own_session = True
+        try:
+            # Atomic update: only updates if state exists, is NOT consumed, and NOT expired
+            rows_updated = db.query(OAuthState).filter(
+                OAuthState.state_token == state,
+                OAuthState.is_consumed == False,
+                OAuthState.expires_at > now
+            ).update(
+                {
+                    OAuthState.is_consumed: True,
+                    OAuthState.consumed_at: now
+                },
+                synchronize_session=False
+            )
+            db.commit()
+
+            if rows_updated > 0:
+                # Successfully consumed atomically! Fetch code_verifier
+                record = db.query(OAuthState).filter(OAuthState.state_token == state).first()
+                if record and record.code_verifier:
+                    logger.info("OAuth state successfully validated and consumed atomically from database.")
+                    return record.code_verifier
+
+            # If atomic update did not update any row, check why to provide accurate security audit logging
+            existing = db.query(OAuthState).filter(OAuthState.state_token == state).first()
+            if existing:
+                if existing.is_consumed:
+                    logger.warning("OAuth state verification rejected: State has already been consumed (Replay attack blocked).")
+                    return None
+                exp = existing.expires_at
+                if exp and exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=datetime.timezone.utc)
+                if exp and exp <= now:
+                    logger.warning("OAuth state verification rejected: State token has expired.")
+                    return None
+        except Exception as db_err:
+            db.rollback()
+            logger.warning(f"Database OAuth state lookup encountered error: {db_err}")
+        finally:
+            if own_session:
+                db.close()
+
+        # 2. Secondary Fallback: Local JSON store (only if not found in DB, e.g. mock local dev without DB)
+        local_verifier = cls._consume_from_local_json(state)
+        if local_verifier:
+            logger.info("OAuth state consumed from local development store.")
+            return local_verifier
+
+        logger.warning("OAuth state verification rejected: State token not found in any store.")
+        return None
 
 
 def generate_pkce_pair() -> Tuple[str, str]:
@@ -294,12 +432,12 @@ class GmailAuthService:
         logger.info("Gmail credentials securely saved to persistent store.")
 
     @classmethod
-    def consume_oauth_state(cls, state: Optional[str]) -> Optional[str]:
-        """Validates and retrieves the PKCE code_verifier for an OAuth state, deleting it immediately."""
-        return OAuthStateManager.consume(state)
+    def consume_oauth_state(cls, state: Optional[str], db: Optional[Session] = None) -> Optional[str]:
+        """Validates and retrieves the PKCE code_verifier for an OAuth state, consuming it atomically."""
+        return OAuthStateManager.consume(state, db=db)
 
     @classmethod
-    def generate_auth_url(cls, state: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    def generate_auth_url(cls, state: Optional[str] = None, db: Optional[Session] = None) -> Tuple[Optional[str], Optional[str]]:
         """
         Creates an OAuth authorization URL with PKCE (S256) and binds code_verifier to state.
         Returns (authorization_url, error).
@@ -316,7 +454,7 @@ class GmailAuthService:
             code_verifier, code_challenge = generate_pkce_pair()
 
             # 3. Securely store state -> code_verifier mapping with 15-minute TTL
-            OAuthStateManager.store(oauth_state, code_verifier, ttl_seconds=900)
+            OAuthStateManager.store(oauth_state, code_verifier, ttl_seconds=900, db=db)
 
             # 4. Initialize Flow with minimal scopes and redirect URI
             flow = Flow.from_client_config(

@@ -11,6 +11,7 @@ from app.models.complaint import (
 from app.models.email_message import EmailMessage
 from app.models.authority import Department, User, RevokedToken
 from app.models.oauth_token import OAuthToken
+from app.models.oauth_state import OAuthState
 
 __all__ = [
     "PhysicalIssue",
@@ -26,4 +27,5 @@ __all__ = [
     "User",
     "RevokedToken",
     "OAuthToken",
+    "OAuthState",
 ]

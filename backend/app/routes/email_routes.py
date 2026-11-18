@@ -377,12 +377,13 @@ async def trigger_inbox_sync(
 
 @router.post("/oauth/start")
 async def start_oauth_flow(
+    db: Session = Depends(get_db),
     current_user: User = Depends(require_roles(["admin"]))
 ):
     """
     Generates a Google OAuth authorization URL to connect JanSakshi to a municipal Gmail inbox.
     """
-    auth_url, error = GmailAuthService.generate_auth_url()
+    auth_url, error = GmailAuthService.generate_auth_url(db=db)
     if error:
         raise HTTPException(status_code=400, detail=error)
     return {
@@ -413,7 +414,7 @@ async def oauth_callback(
         )
 
     # Retrieve and consume the matching PKCE code_verifier bound to this state
-    code_verifier = GmailAuthService.consume_oauth_state(state)
+    code_verifier = GmailAuthService.consume_oauth_state(state, db=db)
     if not code_verifier:
         logger.warning(f"OAuth callback state verification failed or session expired.")
         return RedirectResponse(
