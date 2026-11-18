@@ -1,10 +1,17 @@
+import os
+import logging
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, status
+import requests
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, BackgroundTasks, status
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.repositories import ComplaintRepository
-from app.models.complaint import AIAnalysis, PhysicalIssue
+from app.models.complaint import Complaint, Evidence, AIAnalysis, PhysicalIssue
+from app.services.storage_service import BLOB_READ_WRITE_TOKEN
+
+logger = logging.getLogger("jansakshi.complaints")
 from app.pipeline import ComplaintProcessingPipeline, NormalizedComplaintInput
 from app.services.location_service import resolve_location_input
 from app.services.issue_service import PhysicalIssueService
@@ -249,4 +256,75 @@ async def associate_complaint_to_issue(
         issue_id=updated.issue_id,
         message=f"Complaint '{complaint_id}' successfully updated.",
         updated_at=updated.updated_at
+    )
+
+@router.get("/{complaint_id}/evidence/{stored_filename}")
+async def get_citizen_evidence_file(
+    complaint_id: str,
+    stored_filename: str,
+    token: Optional[str] = Query(None, description="Citizen tracking token"),
+    tracking_token: Optional[str] = Query(None, description="Citizen tracking token"),
+    db: Session = Depends(get_db)
+):
+    """
+    Secure citizen evidence retrieval endpoint.
+    Verifies that the requested evidence belongs to the specified complaint,
+    and that the citizen has supplied the authentic tracking_token.
+    Streams private file directly without exposing cloud credentials or private URLs.
+    """
+    clean_cid = complaint_id.strip()
+    clean_name = os.path.basename(stored_filename.strip())
+
+    complaint = db.query(Complaint).filter(Complaint.complaint_id == clean_cid).first()
+    if not complaint:
+        raise HTTPException(status_code=404, detail="Complaint not found.")
+
+    ev = db.query(Evidence).filter(
+        Evidence.stored_filename == clean_name,
+        Evidence.complaint_id == clean_cid
+    ).first()
+    if not ev:
+        raise HTTPException(status_code=404, detail="Evidence record not found for this complaint.")
+
+    candidate_token = (tracking_token or token or "").strip()
+    if not candidate_token or complaint.tracking_token != candidate_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Invalid or missing tracking token for this complaint evidence."
+        )
+
+    # If evidence is hosted in Vercel Blob (Private cloud storage), stream via server-side authenticated GET
+    if ev.storage_path.startswith("http://") or ev.storage_path.startswith("https://"):
+        headers = {}
+        if BLOB_READ_WRITE_TOKEN and ("vercel-storage.com" in ev.storage_path or "blob.vercel" in ev.storage_path):
+            headers["Authorization"] = f"Bearer {BLOB_READ_WRITE_TOKEN}"
+
+        try:
+            res = requests.get(ev.storage_path, headers=headers, stream=True, timeout=30)
+            if res.status_code != 200:
+                logger.error(f"Failed to fetch evidence from private blob: {ev.storage_path} (Status {res.status_code})")
+                raise HTTPException(status_code=404, detail="Evidence file could not be retrieved from private cloud storage.")
+
+            return StreamingResponse(
+                res.iter_content(chunk_size=65536),
+                media_type=ev.file_type or "image/jpeg",
+                headers={
+                    "Content-Disposition": f'inline; filename="{ev.original_filename}"',
+                    "Cache-Control": "private, max-age=300"
+                }
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error streaming evidence from private blob: {e}")
+            raise HTTPException(status_code=502, detail="Error retrieving evidence from cloud storage.")
+
+    # Local filesystem storage
+    if not os.path.exists(ev.storage_path):
+        raise HTTPException(status_code=404, detail="Evidence file not found on disk.")
+
+    return FileResponse(
+        path=ev.storage_path,
+        media_type=ev.file_type or "image/jpeg",
+        filename=ev.original_filename
     )

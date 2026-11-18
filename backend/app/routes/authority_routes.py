@@ -7,8 +7,10 @@ department assignment, administrative status transitions, escalation controls, a
 import os
 from typing import Optional, List
 import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, UploadFile, File, Form, status
+from fastapi.responses import FileResponse, StreamingResponse
+import requests
+import logging
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, and_, desc, asc
@@ -16,8 +18,11 @@ from sqlalchemy import func, or_, and_, desc, asc
 from app.database import get_db
 from app.models.complaint import Complaint, PhysicalIssue, Evidence, ComplaintEvent, AIAnalysis, DuplicateMatch
 from app.models.authority import Department, User
-from app.core.security import get_current_user, require_roles
+from app.core.security import get_current_user, require_roles, get_user_from_token_str
 from app.core.config import utc_now, BASE_DIR
+from app.services.storage_service import BLOB_READ_WRITE_TOKEN
+
+logger = logging.getLogger("jansakshi.authority")
 
 router = APIRouter(prefix="/api/authority", tags=["Authority Dashboard"])
 
@@ -1536,25 +1541,107 @@ async def get_audit_trail(
 @router.get("/evidence/{stored_filename}")
 async def get_evidence_file(
     stored_filename: str,
+    token: Optional[str] = Query(None, description="Authority JWT access token or Citizen tracking token"),
+    tracking_token: Optional[str] = Query(None, description="Citizen tracking token"),
+    authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ):
-    """Stream evidence photo or video securely from local storage or Vercel Blob."""
+    """
+    Stream evidence photo or video securely from local storage or private Vercel Blob.
+    Enforces role-based authority access and citizen tracking access.
+    Never exposes raw private Blob URLs or master credentials to unauthenticated users.
+    """
     clean_name = os.path.basename(stored_filename.strip())
     ev = db.query(Evidence).filter(Evidence.stored_filename == clean_name).first()
     if not ev:
         raise HTTPException(status_code=404, detail="Evidence record not found.")
 
-    # If evidence is hosted in Vercel Blob, redirect directly to secure Blob URL
-    if ev.storage_path.startswith("http://") or ev.storage_path.startswith("https://"):
-        from fastapi.responses import RedirectResponse
-        return RedirectResponse(url=ev.storage_path)
+    # ---------------------------------------------------------
+    # Authentication & Authorization Verification
+    # ---------------------------------------------------------
+    authorized = False
+    auth_token = None
 
+    if authorization and authorization.lower().startswith("bearer "):
+        auth_token = authorization[7:].strip()
+    elif token:
+        auth_token = token.strip()
+
+    # 1. Authority User Check (JWT Token)
+    if auth_token:
+        user = get_user_from_token_str(auth_token, db)
+        if user:
+            if user.role in ["admin", "authority_officer"]:
+                authorized = True
+            elif user.role == "department_officer":
+                assigned_dept = ev.complaint.assigned_department_id if ev.complaint else None
+                authorized_depts = user.get_authorized_department_ids()
+                # Department officers can view evidence for their department or unassigned intake
+                if assigned_dept is None or assigned_dept in authorized_depts:
+                    authorized = True
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Access forbidden: You do not have permission to view evidence for this department's complaint."
+                    )
+            else:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    # 2. Citizen Tracking Token Check
+    if not authorized:
+        candidate_tracking = tracking_token or (token if not auth_token else None)
+        if candidate_tracking and ev.complaint and ev.complaint.tracking_token:
+            if candidate_tracking.strip() == ev.complaint.tracking_token.strip():
+                authorized = True
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Forbidden: Invalid tracking token for this complaint evidence."
+                )
+
+    if not authorized:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required: Provide valid authority credentials or citizen tracking token.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    # ---------------------------------------------------------
+    # Secure Content Streaming
+    # ---------------------------------------------------------
+    # If evidence is hosted in Vercel Blob (Private cloud storage), stream via server-side authenticated GET
+    if ev.storage_path.startswith("http://") or ev.storage_path.startswith("https://"):
+        headers = {}
+        if BLOB_READ_WRITE_TOKEN and ("vercel-storage.com" in ev.storage_path or "blob.vercel" in ev.storage_path):
+            headers["Authorization"] = f"Bearer {BLOB_READ_WRITE_TOKEN}"
+
+        try:
+            res = requests.get(ev.storage_path, headers=headers, stream=True, timeout=30)
+            if res.status_code != 200:
+                logger.error(f"Failed to fetch evidence from private blob: {ev.storage_path} (Status {res.status_code})")
+                raise HTTPException(status_code=404, detail="Evidence file could not be retrieved from private cloud storage.")
+
+            return StreamingResponse(
+                res.iter_content(chunk_size=65536),
+                media_type=ev.file_type or "image/jpeg",
+                headers={
+                    "Content-Disposition": f'inline; filename="{ev.original_filename}"',
+                    "Cache-Control": "private, max-age=300"
+                }
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error streaming evidence from private blob: {e}")
+            raise HTTPException(status_code=502, detail="Error retrieving evidence from cloud storage.")
+
+    # Local filesystem storage
     if not os.path.exists(ev.storage_path):
         raise HTTPException(status_code=404, detail="Evidence file not found on disk.")
 
     return FileResponse(
         path=ev.storage_path,
-        media_type=ev.file_type,
+        media_type=ev.file_type or "image/jpeg",
         filename=ev.original_filename
     )
 

@@ -199,6 +199,21 @@ def cleanup_expired_revoked_tokens(db: Session) -> int:
     db.commit()
     return deleted_count
 
+def get_user_from_token_str(token: str, db: Session) -> Optional[User]:
+    """Helper: Decodes access token, validates revocation, and returns active User or None."""
+    if not token:
+        return None
+    payload = decode_access_token(token)
+    if payload is None:
+        return None
+    jti = payload.get("jti")
+    if jti and is_token_revoked(db, jti):
+        return None
+    username: str = payload.get("sub")
+    if username is None:
+        return None
+    return db.query(User).filter(User.username == username, User.is_active == True).first()
+
 async def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     """Dependency: Extract current authenticated user from Bearer access token."""
     credentials_exception = HTTPException(

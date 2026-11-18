@@ -125,6 +125,7 @@ def run_evidence_migration(execute: bool, blob_token: str):
                         "Authorization": f"Bearer {blob_token}",
                         "x-content-type": ev.file_type,
                         "x-add-random-suffix": "false",
+                        "x-vercel-blob-access": "private",
                     }
                     res = requests.put(upload_url, data=content, headers=headers, timeout=45)
                     if not res.ok:
@@ -139,8 +140,12 @@ def run_evidence_migration(execute: bool, blob_token: str):
                         details.append(item)
                         continue
 
-                    # 5. Verify file is readable via public HTTPS GET
-                    v_res = requests.get(blob_url, timeout=15)
+                    # 5. Verify file is readable via authenticated private HTTPS GET
+                    v_res = requests.get(
+                        blob_url,
+                        headers={"Authorization": f"Bearer {blob_token}"},
+                        timeout=15
+                    )
                     if v_res.status_code == 200 and len(v_res.content) == actual_size:
                         verified += 1
                         ev.storage_path = blob_url
@@ -174,13 +179,13 @@ def run_evidence_migration(execute: bool, blob_token: str):
         print(f"Corrupted or Invalid Header: {corrupted:>5}")
         if execute:
             print(f"Successfully Migrated:       {migrated:>5}")
-            print(f"Verified Public Read:        {verified:>5}")
+            print(f"Verified Private Read:       {verified:>5}")
         print("=" * 80)
 
         if not execute:
             print("\n[NOTE] Dry-run completed. All 15 local files remain untouched on disk.")
             print("To execute live migration to Vercel Blob once cloud storage is provisioned:")
-            print("  python migrate_evidence_to_blob.py --blob-token \"<token>\" --execute")
+            print("  set BLOB_READ_WRITE_TOKEN=<token> && python migrate_evidence_to_blob.py --execute")
 
     finally:
         db.close()

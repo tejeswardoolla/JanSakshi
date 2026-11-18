@@ -9,11 +9,12 @@ import {
 import AuthorityLayout from '../../components/AuthorityLayout'
 import { useAuth } from '../../context/AuthContext'
 import { formatToIST } from '../../utils/dateTime'
+import { getApiUrl } from '../../config/api'
 
 export default function AuthorityResolutionReviewDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const { authFetch, user } = useAuth()
+  const { authFetch, user, token } = useAuth()
 
   const [submission, setSubmission] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -474,7 +475,7 @@ export default function AuthorityResolutionReviewDetailPage() {
                     {submission.after_photo_urls.map((url, i) => (
                       <div key={i} className="aspect-video rounded-xl overflow-hidden border border-emerald-500/30 bg-[#10131C] relative group">
                         <img
-                          src={url}
+                          src={url.startsWith('/api') ? `${getApiUrl(url)}${token ? `?token=${encodeURIComponent(token)}` : ''}` : url}
                           alt={`Field evidence ${i + 1}`}
                           className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                         />

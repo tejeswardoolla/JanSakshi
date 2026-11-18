@@ -29,7 +29,7 @@ export default function DepartmentWorkOrderDetailPage() {
   const { id } = useParams()
   const location = useLocation()
   const navigate = useNavigate()
-  const { user, isAuthenticated, authFetch } = useAuth()
+  const { user, isAuthenticated, authFetch, token } = useAuth()
 
   const [complaint, setComplaint] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -998,7 +998,7 @@ export default function DepartmentWorkOrderDetailPage() {
             </div>
             <div className="p-4 bg-black/50 flex items-center justify-center max-h-[75vh] overflow-hidden">
               <img
-                src={getApiUrl(selectedEvidenceView.view_url)}
+                src={`${getApiUrl(selectedEvidenceView.view_url)}${token ? `?token=${encodeURIComponent(token)}` : ''}`}
                 alt={selectedEvidenceView.original_filename}
                 className="max-h-[70vh] w-auto object-contain rounded-xl"
               />

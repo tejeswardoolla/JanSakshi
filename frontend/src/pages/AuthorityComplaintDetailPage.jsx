@@ -14,7 +14,7 @@ import { formatToIST, formatISTDateOnly, formatISTTimeOnly } from '../utils/date
 
 export default function AuthorityComplaintDetailPage() {
   const { id } = useParams()
-  const { user, isAuthenticated, authFetch } = useAuth()
+  const { user, isAuthenticated, authFetch, token } = useAuth()
   const navigate = useNavigate()
 
   // Route role-awareness: Department Officers always receive the dedicated Work Order inspection experience
@@ -1295,7 +1295,7 @@ export default function AuthorityComplaintDetailPage() {
             </div>
             <div className="p-3 overflow-auto flex items-center justify-center max-h-[75vh]">
               <img
-                src={getApiUrl(selectedEvidenceView.view_url)}
+                src={`${getApiUrl(selectedEvidenceView.view_url)}${token ? `?token=${encodeURIComponent(token)}` : ''}`}
                 alt={selectedEvidenceView.original_filename}
                 className="max-h-full max-w-full object-contain rounded-2xl"
               />

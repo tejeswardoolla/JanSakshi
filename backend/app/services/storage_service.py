@@ -14,7 +14,12 @@ Includes:
 import os
 import uuid
 import logging
-from typing import Dict, Any, Optional
+import hmac
+import hashlib
+import json
+import base64
+import time
+from typing import Dict, Any, Optional, List
 import aiofiles
 import requests
 from fastapi import UploadFile, HTTPException
@@ -161,6 +166,7 @@ class VercelBlobStorageProvider(StorageProvider):
             "Authorization": f"Bearer {self.token}",
             "x-content-type": content_type,
             "x-add-random-suffix": "false",
+            "x-vercel-blob-access": "private",
         }
         res = requests.put(url, data=content, headers=headers, timeout=30)
         if not res.ok:
@@ -173,7 +179,10 @@ class VercelBlobStorageProvider(StorageProvider):
         return blob_url
 
     def get_bytes(self, storage_path: str) -> bytes:
-        res = requests.get(storage_path, timeout=30)
+        headers = {
+            "Authorization": f"Bearer {self.token}"
+        }
+        res = requests.get(storage_path, headers=headers, timeout=30)
         if not res.ok:
             raise FileNotFoundError(f"Could not retrieve file from Vercel Blob ({res.status_code}): {storage_path}")
         return res.content
@@ -263,9 +272,13 @@ def get_evidence_content(storage_path: str) -> bytes:
     """
     Retrieves binary content of an evidence file from either local disk or remote Vercel Blob.
     Used by Gemini multimodal AI client.
+    Sends authenticated request for private Vercel Blob without exposing credentials externally.
     """
     if storage_path.startswith("http://") or storage_path.startswith("https://"):
-        res = requests.get(storage_path, timeout=30)
+        headers = {}
+        if BLOB_READ_WRITE_TOKEN and ("vercel-storage.com" in storage_path or "blob.vercel" in storage_path):
+            headers["Authorization"] = f"Bearer {BLOB_READ_WRITE_TOKEN}"
+        res = requests.get(storage_path, headers=headers, timeout=30)
         if not res.ok:
             raise FileNotFoundError(f"Could not load evidence from remote URL ({res.status_code}): {storage_path}")
         return res.content
@@ -287,27 +300,93 @@ def cleanup_orphaned_file(storage_path: str) -> None:
 # -------------------------------------------------------------
 # Direct Browser-to-Blob Upload Preparation (Bypass 4.5MB limit)
 # -------------------------------------------------------------
+def generate_blob_client_token(
+    read_write_token: str,
+    pathname: str,
+    allowed_content_types: Optional[List[str]] = None,
+    maximum_size_in_bytes: int = MAX_FILE_SIZE,
+    valid_duration_seconds: int = 300,
+    allow_overwrite: bool = False
+) -> str:
+    """
+    Generates a secure, short-lived Vercel Blob client upload token
+    matching Vercel's official client token specification (@vercel/blob/client).
+    Restricted strictly to the allocated pathname, enforces size limits and private access,
+    and strictly prevents overwrites and deletions.
+    Never exposes the master read-write token.
+    """
+    if not read_write_token:
+        raise ValueError("BLOB_READ_WRITE_TOKEN is required to generate client token.")
+
+    parts = read_write_token.split("_")
+    # Expected format: vercel_blob_rw_<storeId>_<secret>
+    if len(parts) >= 4:
+        store_id = parts[3]
+    elif len(parts) >= 2:
+        store_id = parts[-2]
+    else:
+        store_id = "store"
+
+    valid_until = int((time.time() + valid_duration_seconds) * 1000)
+
+    payload_dict = {
+        "pathname": pathname,
+        "allowedContentTypes": allowed_content_types or list(ALLOWED_MIME_TYPES),
+        "maximumSizeInBytes": maximum_size_in_bytes,
+        "validUntil": valid_until,
+        "allowOverwrite": allow_overwrite,
+        "access": "private"
+    }
+
+    payload_json = json.dumps(payload_dict, separators=(",", ":"))
+    payload_b64 = base64.b64encode(payload_json.encode("utf-8")).decode("ascii")
+
+    # HMAC-SHA256 signature using the master token as the secret key
+    signature = hmac.new(
+        read_write_token.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    # Combined string: signature.payload_b64, base64 encoded
+    combined = f"{signature}.{payload_b64}"
+    combined_b64 = base64.b64encode(combined.encode("utf-8")).decode("ascii")
+
+    return f"vercel_blob_client_{store_id}_{combined_b64}"
+
 def prepare_direct_upload(filename: str, content_type: str, file_size: int) -> Dict[str, Any]:
     """
     Pre-authorizes a direct browser-to-Blob upload when Vercel Blob is active.
+    Issues a short-lived, scoped client token (vercel_blob_client_...) restricted to the allocated pathname.
+    NEVER exposes the master BLOB_READ_WRITE_TOKEN.
     When local storage is active, returns direct_upload=False to use standard multipart route.
     """
     validate_upload_metadata(filename, content_type, file_size)
     ext = os.path.splitext(filename.lower())[1]
     stored_filename = f"{uuid.uuid4().hex}{ext}"
+    pathname = f"evidence/{stored_filename}"
 
     if is_blob_storage_enabled():
+        client_token = generate_blob_client_token(
+            read_write_token=BLOB_READ_WRITE_TOKEN,
+            pathname=pathname,
+            allowed_content_types=[content_type] if content_type in ALLOWED_MIME_TYPES else list(ALLOWED_MIME_TYPES),
+            maximum_size_in_bytes=MAX_FILE_SIZE,
+            valid_duration_seconds=300,
+            allow_overwrite=False
+        )
         return {
             "direct_blob_enabled": True,
-            "upload_url": f"{VERCEL_BLOB_API_URL}/evidence/{stored_filename}",
-            "pathname": f"evidence/{stored_filename}",
+            "upload_url": f"{VERCEL_BLOB_API_URL}/{pathname}",
+            "pathname": pathname,
             "stored_filename": stored_filename,
             "content_type": content_type,
-            "token": BLOB_READ_WRITE_TOKEN,
+            "client_token": client_token,
             "headers": {
-                "Authorization": f"Bearer {BLOB_READ_WRITE_TOKEN}",
+                "Authorization": f"Bearer {client_token}",
                 "x-content-type": content_type,
-                "x-add-random-suffix": "false"
+                "x-add-random-suffix": "false",
+                "x-vercel-blob-access": "private"
             }
         }
 
