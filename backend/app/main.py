@@ -7,6 +7,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_redoc_html
 from sqlalchemy import inspect
 
 from app.database import Base, engine
@@ -50,9 +51,23 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
-    redoc_url="/api/redoc",
+    redoc_url=None,
     lifespan=lifespan
 )
+
+@app.get("/api/redoc", include_in_schema=False)
+async def redoc_html():
+    """
+    Pinned stable ReDoc 2.4.0 documentation viewer.
+    Replaces unpinned redoc@next which introduced syntax errors in ESM worker bundles.
+    """
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - ReDoc",
+        redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2.4.0/bundles/redoc.standalone.js",
+        redoc_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
+        with_google_fonts=True,
+    )
 
 # CORS middleware
 app.add_middleware(
