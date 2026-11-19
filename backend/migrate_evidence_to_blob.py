@@ -43,8 +43,8 @@ def parse_args():
     )
     parser.add_argument(
         "--blob-token",
-        default=BLOB_READ_WRITE_TOKEN,
-        help="Vercel Blob token. Defaults to BLOB_READ_WRITE_TOKEN env var."
+        default=BLOB_READ_WRITE_TOKEN or os.getenv("BLOB_READ_WRITE_TOKEN", ""),
+        help="Vercel Blob token. Strongly recommend setting BLOB_READ_WRITE_TOKEN env var instead of passing via CLI."
     )
     return parser.parse_args()
 

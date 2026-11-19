@@ -15,6 +15,7 @@ import os
 import sys
 import argparse
 import datetime
+import re
 from typing import Dict, List, Any, Optional
 
 from sqlalchemy import create_engine, inspect, text, select
@@ -50,7 +51,9 @@ TABLE_ORDER = [
 SEQUENCE_TABLES = [
     ("departments", "id"),
     ("users", "id"),
+    ("revoked_tokens", "id"),
     ("physical_issues", "id"),
+    ("complaints", "id"),
     ("evidence", "id"),
     ("complaint_events", "id"),
     ("ai_analyses", "id"),
@@ -62,6 +65,12 @@ SEQUENCE_TABLES = [
     ("oauth_states", "id"),
 ]
 
+def mask_database_url(url: str) -> str:
+    """Masks database passwords in connection URLs to prevent credential leakage."""
+    if not url:
+        return "(Not Specified - Dry Run Only)"
+    return re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", url)
+
 def parse_args():
     parser = argparse.ArgumentParser(description="JanSakshi SQLite to PostgreSQL Migration Utility")
     parser.add_argument(
@@ -71,14 +80,20 @@ def parse_args():
     )
     parser.add_argument(
         "--target-url",
-        default=os.getenv("TARGET_DATABASE_URL", ""),
-        help="Target PostgreSQL database URL (Neon). Defaults to TARGET_DATABASE_URL env var."
+        default=os.getenv("TARGET_DATABASE_URL", "") or (os.getenv("DATABASE_URL", "") if os.getenv("DATABASE_URL", "").startswith("postgres") else ""),
+        help="Target PostgreSQL database URL (Neon). Defaults to TARGET_DATABASE_URL or postgresql DATABASE_URL env var."
     )
     parser.add_argument(
         "--execute",
         action="store_true",
         default=False,
         help="Execute actual migration. If omitted, utility runs in safe DRY-RUN verification mode."
+    )
+    parser.add_argument(
+        "--clean-target",
+        action="store_true",
+        default=False,
+        help="Safely truncate existing target tables with CASCADE before migration for clean retry."
     )
     parser.add_argument(
         "--batch-size",
@@ -130,13 +145,13 @@ def validate_source_integrity(source_engine) -> Dict[str, Any]:
         "issues": issues
     }
 
-def run_migration(source_url: str, target_url: str, execute: bool, batch_size: int = 500):
+def run_migration(source_url: str, target_url: str, execute: bool, clean_target: bool = False, batch_size: int = 500):
     mode_str = "EXECUTE (LIVE DATA MIGRATION)" if execute else "DRY RUN (READ-ONLY AUDIT)"
     print("=" * 80)
     print(f"JANSAKSHI DATABASE MIGRATION ENGINE — {mode_str}")
     print("=" * 80)
     print(f"Source SQLite:   {source_url}")
-    print(f"Target Database: {target_url or '(Not Specified - Dry Run Only)'}")
+    print(f"Target Database: {mask_database_url(target_url)}")
     print(f"Timestamp:       {datetime.datetime.now(datetime.timezone.utc).isoformat()}")
     print("-" * 80)
 
@@ -168,14 +183,15 @@ def run_migration(source_url: str, target_url: str, execute: bool, batch_size: i
         print("DRY-RUN VERIFICATION SUCCESSFUL")
         print("=" * 80)
         print("The source SQLite database was verified without mutation.")
-        print("To execute migration to Neon PostgreSQL, provide target connection string:")
-        print("  python migrate_sqlite_to_postgres.py --target-url \"postgresql://user:pass@ep-...neon.tech/neondb?sslmode=require\" --execute")
+        print("To execute migration to Neon PostgreSQL, set TARGET_DATABASE_URL and run:")
+        print("  set TARGET_DATABASE_URL=postgresql://user:pass@ep-...neon.tech/neondb?sslmode=require")
+        print("  python migrate_sqlite_to_postgres.py --execute")
         print("=" * 80)
         return
 
     # --- LIVE MIGRATION LOGIC (ONLY REACHED IF --execute IS PASSED) ---
     if not target_url:
-        print("\n[ERROR] --target-url must be provided when --execute flag is active.")
+        print("\n[ERROR] --target-url or TARGET_DATABASE_URL must be provided when --execute flag is active.")
         sys.exit(1)
 
     norm_target_url = normalize_database_url(target_url)
@@ -189,6 +205,25 @@ def run_migration(source_url: str, target_url: str, execute: bool, batch_size: i
     # Non-destructively creates tables if they do not exist
     Base.metadata.create_all(bind=target_engine)
     print("  [PASS] Target PostgreSQL schema confirmed ready.")
+
+    # Inspect current target record counts to ensure safety
+    target_pre_counts = inspect_database_counts(target_engine)
+    total_existing_target_records = sum(target_pre_counts.values())
+
+    if total_existing_target_records > 0 and not clean_target:
+        print(f"\n  [CAUTION] Target database already contains {total_existing_target_records} records.")
+        print("  If re-running a previously aborted migration, specify --clean-target to reset target tables first.")
+
+    if clean_target:
+        print("\n--- 3b. CLEANING TARGET POSTGRESQL TABLES (--clean-target active) ---")
+        inspector = inspect(target_engine)
+        existing_target_tables = set(inspector.get_table_names())
+        valid_tables_to_truncate = [t for t in reversed(TABLE_ORDER) if t in existing_target_tables]
+        if valid_tables_to_truncate:
+            with target_engine.begin() as t_conn:
+                reversed_tables = ", ".join(f'"{t}"' for t in valid_tables_to_truncate)
+                t_conn.execute(text(f"TRUNCATE TABLE {reversed_tables} CASCADE;"))
+                print(f"  [PASS] Safely truncated {len(valid_tables_to_truncate)} target tables for clean idempotent migration.")
 
     print("\n--- 4. MIGRATING TABLE DATA ---")
     migrated_counts = {}
@@ -212,8 +247,15 @@ def run_migration(source_url: str, target_url: str, execute: bool, batch_size: i
             inserted = 0
             for i in range(0, row_count, batch_size):
                 chunk = rows[i:i + batch_size]
-                # Convert Mapping to dict
                 chunk_dicts = [dict(r) for r in chunk]
+
+                # Referential sanity: handle any historical dangling evidence_id in ai_analyses (SET NULL)
+                if table_name == "ai_analyses":
+                    valid_ev_ids = {r["id"] for r in s_conn.execute(text("SELECT id FROM evidence")).mappings().all()}
+                    for d in chunk_dicts:
+                        if d.get("evidence_id") and d["evidence_id"] not in valid_ev_ids:
+                            d["evidence_id"] = None
+
                 t_conn.execute(table_obj.insert(), chunk_dicts)
                 inserted += len(chunk_dicts)
 
@@ -261,5 +303,6 @@ if __name__ == "__main__":
         source_url=args.source_db,
         target_url=args.target_url,
         execute=args.execute,
+        clean_target=args.clean_target,
         batch_size=args.batch_size
     )
