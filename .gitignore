@@ -62,6 +62,7 @@ backend/execute_safe_demo_cleanup.py
 backend/verify_post_cleanup.py
 backend/render_screenshot.py
 backend/send_demo_acknowledgement.py
+backend/configure_neon.py
 
 # --- Python & Virtual Environments ---
 __pycache__/
