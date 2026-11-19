@@ -6,6 +6,7 @@ pydantic-settings==2.6.1
 sqlalchemy==2.1.8
 python-multipart==0.0.33
 openlocationcode==1.0.1
+psycopg[binary]==3.3.9
 psycopg2-binary==2.9.13
 aiofiles==25.1.0
 google-genai==3.0.0
