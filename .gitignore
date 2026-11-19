@@ -63,6 +63,7 @@ backend/verify_post_cleanup.py
 backend/render_screenshot.py
 backend/send_demo_acknowledgement.py
 backend/configure_neon.py
+backend/configure_blob_token.py
 
 # --- Python & Virtual Environments ---
 __pycache__/
@@ -133,3 +134,7 @@ report_template_extracted/
 backend/report_template_extracted/
 scratch/
 backend/scratch/
+
+.vercel
+.env*
+tools/migrator/
