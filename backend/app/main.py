@@ -49,6 +49,7 @@ app = FastAPI(
     description="AI-Powered Public Complaint Verification & Departmental Accountability Platform – Phase 9 Release",
     version="1.0.0",
     docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
     redoc_url="/api/redoc",
     lifespan=lifespan
 )
