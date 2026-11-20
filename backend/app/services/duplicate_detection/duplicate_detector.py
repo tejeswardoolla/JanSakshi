@@ -76,17 +76,33 @@ class DuplicateDetector:
             def _find_existing_exact_anchor() -> Optional[PhysicalIssue]:
                 if target_lat is not None and target_lon is not None:
                     try:
-                        return db.query(PhysicalIssue).filter(
-                            PhysicalIssue.category == target_category,
-                            PhysicalIssue.representative_latitude >= target_lat - lat_tol,
-                            PhysicalIssue.representative_latitude <= target_lat + lat_tol,
-                            PhysicalIssue.representative_longitude >= target_lon - lon_tol,
-                            PhysicalIssue.representative_longitude <= target_lon + lon_tol,
-                        ).first()
+                        with db.no_autoflush:
+                            return db.query(PhysicalIssue).filter(
+                                PhysicalIssue.category == target_category,
+                                PhysicalIssue.representative_latitude >= target_lat - lat_tol,
+                                PhysicalIssue.representative_latitude <= target_lat + lat_tol,
+                                PhysicalIssue.representative_longitude >= target_lon - lon_tol,
+                                PhysicalIssue.representative_longitude <= target_lon + lon_tol,
+                            ).first()
                     except Exception:
                         db.rollback()
                         raise
                 return None
+
+            def _is_session_clean() -> bool:
+                if bool(db.dirty or db.new or db.deleted):
+                    return False
+                for obj in db.identity_map.values():
+                    if db.is_modified(obj):
+                        return False
+                trans = db.get_transaction()
+                if trans and (
+                    bool(getattr(trans, "_dirty", None)) or
+                    bool(getattr(trans, "_new", None)) or
+                    bool(getattr(trans, "_deleted", None))
+                ):
+                    return False
+                return True
 
             def _release_read_lock_if_clean() -> None:
                 """
@@ -94,10 +110,19 @@ class DuplicateDetector:
                 When returning an existing anchor without mutating data, end the read transaction
                 so the advisory mutex is immediately released prior to downstream candidate
                 evaluation (expensive text/image similarity scoring).
-                Only commits if there is no pending uncommitted caller state (not db.dirty, db.new, db.deleted).
+                Only commits if there is no pending uncommitted caller state (not db.dirty, db.new, db.deleted,
+                and no flushed/modified objects in identity map or transaction).
+                If uncommitted caller state is detected, avoids committing to protect caller writes,
+                and executes explicit advisory unlock.
                 """
-                if dialect_name == "postgresql" and not (db.dirty or db.new or db.deleted):
-                    db.commit()
+                if dialect_name == "postgresql":
+                    lock_key = "jansakshi_provisional_anchor_mutex"
+                    try:
+                        db.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": lock_key})
+                    except Exception:
+                        pass
+                    if _is_session_clean():
+                        db.commit()
 
             # Acquire spatial lock before checking existing anchor or allocating a new anchor
             _acquire_spatial_lock()

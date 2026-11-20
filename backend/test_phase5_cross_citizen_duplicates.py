@@ -2017,7 +2017,6 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         from app.database import Base
         from app.models.complaint import Complaint, PhysicalIssue, DuplicateMatch
         from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
-        from app.routes.duplicates import approve_match
 
         test_pg_engine = create_engine(test_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
         try:
@@ -2077,8 +2076,12 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
             sess_init1.close()
             sess_init2.close()
 
+        # Synchronization barrier ensuring both workers overlap before attempting anchor creation
+        barrier = threading.Barrier(2)
+
         # Run concurrent anchor creation / evaluation using 2 separate sessions on genuine PostgreSQL
         def worker_evaluate(comp_id: str):
+            barrier.wait(timeout=10)
             w_session = PgSessionFactory()
             try:
                 matches = DuplicateDetector.evaluate_complaint(comp_id, w_session, search_radius_meters=150.0)
@@ -2109,17 +2112,17 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
             # Subsequent complaint must have a pending DuplicateMatch
             pending_match = verify_sess.query(DuplicateMatch).filter_by(
                 complaint_id="JS-2026-PG-TEST-02",
-                physical_issue_id=canonical_ref
+                candidate_physical_issue_id=canonical_ref
             ).first()
             self.assertIsNotNone(pending_match, "Pending DuplicateMatch must be recorded for human review")
             self.assertEqual(pending_match.review_status, "pending")
 
             # Verify that ONLY authority approval associates the complaint
-            app_result = approve_match(
+            app_result = DuplicateDetector.approve_match(
+                db=verify_sess,
                 match_id=pending_match.id,
                 reviewer_id="Officer Postgres",
-                review_reason="Verified duplicate on live PG",
-                db=verify_sess
+                review_reason="Verified duplicate on live PG"
             )
             self.assertEqual(app_result["status"], "success")
 
@@ -2169,7 +2172,7 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
 
         def spy_execute(statement, *args, **kwargs):
             stmt_str = str(statement)
-            if "pg_advisory_xact_lock" in stmt_str:
+            if "pg_advisory" in stmt_str:
                 return MagicMock()
             return real_execute(statement, *args, **kwargs)
 
@@ -2191,6 +2194,96 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
             1,
             "Expected db.commit() to be called on clean read transaction to release pg_advisory_xact_lock before returning"
         )
+
+    def test_49_unrelated_pending_change_not_accidentally_committed_on_existing_anchor_return(self):
+        """49. An unrelated uncommitted caller write is NOT committed when returning an existing anchor, while lock is released."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import Complaint, PhysicalIssue
+
+        # 1. Pre-seed and commit an unrelated complaint in the database
+        c_unrelated = self._create_test_complaint(
+            citizen_id="cit-unrelated-01",
+            category="Sanitation",
+            lat=16.9000,
+            lon=80.9000,
+            desc="Original uncommitted test complaint description"
+        )
+        self.db.commit()
+
+        # 2. Pre-seed an existing anchor
+        existing_ref = "ISSUE-2026-PENDING-SAFE-01"
+        existing = PhysicalIssue(
+            issue_reference_id=existing_ref,
+            category="Roads",
+            representative_latitude=16.4500,
+            representative_longitude=80.4500,
+            representative_location="16.4500, 80.4500",
+            description="Existing roads cluster anchor",
+            current_status="Open",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        self.db.add(existing)
+        self.db.commit()
+
+        # 3. Create a target complaint at the existing anchor's coordinates
+        c_target = self._create_test_complaint(
+            citizen_id="cit-target-01",
+            category="Roads",
+            lat=16.4500,
+            lon=80.4500,
+            desc="Road damage at same location as existing anchor"
+        )
+        self.db.commit()
+
+        # 4. Create an unrelated pending change in the caller's session (DO NOT COMMIT)
+        c_unrelated_in_sess = self.db.query(Complaint).filter_by(complaint_id=c_unrelated.complaint_id).first()
+        c_unrelated_in_sess.description = "MODIFIED UNCOMMITTED BY CALLER"
+        self.assertTrue(self.db.is_modified(c_unrelated_in_sess))
+
+        # 5. Spy on commit and advisory unlock execution
+        commit_calls = []
+        real_commit = self.db.commit
+        def spy_commit():
+            commit_calls.append(True)
+            real_commit()
+
+        execute_calls = []
+        real_execute = self.db.execute
+        def spy_execute(statement, *args, **kwargs):
+            stmt_str = str(statement)
+            if "pg_advisory" in stmt_str:
+                execute_calls.append(stmt_str)
+                return MagicMock()
+            return real_execute(statement, *args, **kwargs)
+
+        with patch("app.services.issue_id_service.get_verified_database_dialect", return_value="postgresql"):
+            with patch.object(self.db, "execute", side_effect=spy_execute):
+                with patch.object(self.db, "commit", side_effect=spy_commit):
+                    returned_anchor = DuplicateDetector._create_provisional_anchor(c_target, self.db)
+
+        # 6. Verifications:
+        # A. Existing anchor is returned
+        self.assertEqual(returned_anchor.issue_reference_id, existing_ref)
+        # B. Complaint independence: target complaint is NOT auto-associated
+        self.assertIsNone(c_target.issue_id)
+        # C. db.commit() was NOT called on caller session because session contained uncommitted caller writes!
+        self.assertEqual(len(commit_calls), 0, "db.commit() must NOT be called when session has uncommitted caller writes")
+        # D. In database, unrelated complaint description remains the original committed value!
+        from sqlalchemy.orm import sessionmaker
+        independent_sess = sessionmaker(bind=self.db.get_bind())()
+        try:
+            db_unrelated = independent_sess.query(Complaint).filter_by(complaint_id=c_unrelated.complaint_id).first()
+            self.assertEqual(
+                db_unrelated.description,
+                "Original uncommitted test complaint description",
+                "Unrelated pending write in caller session must NOT be committed to database!"
+            )
+        finally:
+            independent_sess.close()
+        # E. Advisory unlock was executed to release the PostgreSQL advisory lock before returning
+        unlock_executed = any("pg_advisory_unlock" in s for s in execute_calls)
+        self.assertTrue(unlock_executed, "PostgreSQL advisory unlock must be executed before returning to release mutex")
 
 
 if __name__ == "__main__":
