@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, Shield, MapPin, Clock, CheckCircle2, XCircle,
@@ -44,6 +44,145 @@ export default function AuthorityComplaintDetailPage() {
   const [escalatedTo, setEscalatedTo] = useState('Municipal Commissioner')
   const [newInternalNote, setNewInternalNote] = useState('')
   const [selectedEvidenceView, setSelectedEvidenceView] = useState(null)
+  const [evidenceMedia, setEvidenceMedia] = useState({})
+  const objectUrlsMapRef = useRef(new Map()) // evId -> objectUrl
+  const authFetchRef = useRef(authFetch)
+  authFetchRef.current = authFetch
+
+  // Key on unique identity and stored filename of evidence attachments
+  const evidenceKey = (complaint?.evidence || []).map(e => `${e.id}-${e.stored_filename}`).join(',')
+
+  // Unmount-only cleanup: revokes all created object URLs when component unmounts
+  useEffect(() => {
+    return () => {
+      objectUrlsMapRef.current.forEach((url) => {
+        try {
+          URL.revokeObjectURL(url)
+        } catch (e) {}
+      })
+      objectUrlsMapRef.current.clear()
+    }
+  }, [])
+
+  // Evidence loading effect: depends ONLY on evidenceKey (not authFetch), preventing token refresh fetch loops
+  // and preserving existing object URLs without prematurely revoking them while still displayed.
+  useEffect(() => {
+    const evidenceList = complaint?.evidence || []
+    if (evidenceList.length === 0) {
+      objectUrlsMapRef.current.forEach((url) => {
+        try {
+          URL.revokeObjectURL(url)
+        } catch (e) {}
+      })
+      objectUrlsMapRef.current.clear()
+      setEvidenceMedia({})
+      return
+    }
+
+    let isMounted = true
+
+    // Clean up URLs for evidence items that were removed
+    const currentIds = new Set(evidenceList.map(e => e.id))
+    for (const [evId, url] of objectUrlsMapRef.current.entries()) {
+      if (!currentIds.has(evId)) {
+        try {
+          URL.revokeObjectURL(url)
+        } catch (e) {}
+        objectUrlsMapRef.current.delete(evId)
+      }
+    }
+
+    // Set initial loading states only for items that don't already have an active object URL
+    setEvidenceMedia((prev) => {
+      const nextMedia = { ...prev }
+      evidenceList.forEach((ev) => {
+        if (!objectUrlsMapRef.current.has(ev.id)) {
+          nextMedia[ev.id] = {
+            url: null,
+            loading: true,
+            error: null,
+            fileType: ev.file_type || ''
+          }
+        }
+      })
+      return nextMedia
+    })
+
+    // Asynchronously fetch each un-loaded attachment in parallel via authFetchRef (supports token refresh)
+    evidenceList.forEach(async (ev) => {
+      // If already loaded and active, retain existing object URL (do not re-fetch or revoke)
+      if (objectUrlsMapRef.current.has(ev.id)) {
+        return
+      }
+
+      try {
+        const res = await authFetchRef.current(ev.view_url)
+        if (!isMounted) return
+
+        if (!res.ok) {
+          let errorMsg = 'Failed to load evidence file'
+          if (res.status === 401) {
+            errorMsg = 'Authentication required'
+          } else if (res.status === 403) {
+            errorMsg = 'Access forbidden: Department restricted'
+          } else if (res.status === 404) {
+            errorMsg = 'Evidence file not found'
+          } else if (res.status >= 500) {
+            errorMsg = 'Cloud storage unavailable'
+          }
+          if (isMounted) {
+            setEvidenceMedia((prev) => ({
+              ...prev,
+              [ev.id]: {
+                url: null,
+                loading: false,
+                error: errorMsg,
+                fileType: ev.file_type || ''
+              }
+            }))
+          }
+          return
+        }
+
+        const blob = await res.blob()
+        if (!isMounted) return
+
+        const objectUrl = URL.createObjectURL(blob)
+        objectUrlsMapRef.current.set(ev.id, objectUrl)
+
+        if (isMounted) {
+          setEvidenceMedia((prev) => ({
+            ...prev,
+            [ev.id]: {
+              url: objectUrl,
+              loading: false,
+              error: null,
+              fileType: ev.file_type || blob.type || ''
+            }
+          }))
+        } else {
+          URL.revokeObjectURL(objectUrl)
+          objectUrlsMapRef.current.delete(ev.id)
+        }
+      } catch (err) {
+        if (isMounted) {
+          setEvidenceMedia((prev) => ({
+            ...prev,
+            [ev.id]: {
+              url: null,
+              loading: false,
+              error: err.message || 'Error loading evidence',
+              fileType: ev.file_type || ''
+            }
+          }))
+        }
+      }
+    })
+
+    return () => {
+      isMounted = false
+    }
+  }, [evidenceKey])
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -534,44 +673,60 @@ export default function AuthorityComplaintDetailPage() {
                 </p>
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  {complaint.evidence.map((ev) => (
-                    <div
-                      key={ev.id}
-                      className="border border-white/10 rounded-xl overflow-hidden bg-black/40 group relative"
-                    >
-                      {ev.file_type.includes('video') ? (
-                        <div className="p-2">
-                          <video
-                            controls
-                            className="w-full h-48 object-cover rounded-lg bg-black"
-                            src={getApiUrl(ev.view_url)}
-                          />
-                        </div>
-                      ) : (
-                        <div
-                          className="cursor-pointer overflow-hidden h-48 bg-black/60 relative"
-                          onClick={() => setSelectedEvidenceView(ev)}
-                        >
-                          <img
-                            src={getApiUrl(ev.view_url)}
-                            alt={ev.original_filename}
-                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                          />
-                          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                            <span className="text-xs text-white font-medium bg-black/70 px-3 py-1.5 rounded-lg flex items-center gap-1.5">
-                              <Eye className="w-3.5 h-3.5" />
-                              <span>Inspect Full Resolution</span>
-                            </span>
-                          </div>
-                        </div>
-                      )}
+                  {complaint.evidence.map((ev) => {
+                    const media = evidenceMedia[ev.id]
+                    const isVideo = ev.file_type?.includes('video') || media?.fileType?.includes('video')
 
-                      <div className="p-3 border-t border-white/5 text-[11px] font-mono text-white/60 flex items-center justify-between">
-                        <span className="truncate max-w-[160px]">{ev.original_filename}</span>
-                        <span>{Math.round(ev.file_size / 1024)} KB</span>
+                    return (
+                      <div
+                        key={ev.id}
+                        className="border border-white/10 rounded-xl overflow-hidden bg-black/40 group relative"
+                      >
+                        {media?.loading ? (
+                          <div className="w-full h-48 bg-black/60 flex flex-col items-center justify-center gap-2 text-white/50">
+                            <RefreshCw className="w-6 h-6 animate-spin text-[#F36B21]" />
+                            <span className="text-[11px] font-mono">Loading evidence...</span>
+                          </div>
+                        ) : media?.error || !media?.url ? (
+                          <div className="w-full h-48 bg-black/60 border border-red-500/20 flex flex-col items-center justify-center p-4 text-center">
+                            <AlertCircle className="w-7 h-7 text-red-400 mb-1.5" />
+                            <span className="text-xs font-semibold text-red-300">Unable to load evidence</span>
+                            <span className="text-[10px] text-white/50 font-mono mt-1">{media?.error || 'File unavailable'}</span>
+                          </div>
+                        ) : isVideo ? (
+                          <div className="p-2">
+                            <video
+                              controls
+                              className="w-full h-48 object-cover rounded-lg bg-black"
+                              src={media.url}
+                            />
+                          </div>
+                        ) : (
+                          <div
+                            className="cursor-pointer overflow-hidden h-48 bg-black/60 relative"
+                            onClick={() => setSelectedEvidenceView(ev)}
+                          >
+                            <img
+                              src={media.url}
+                              alt={ev.original_filename}
+                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                            />
+                            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                              <span className="text-xs text-white font-medium bg-black/70 px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+                                <Eye className="w-3.5 h-3.5" />
+                                <span>Inspect Full Resolution</span>
+                              </span>
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="p-3 border-t border-white/5 text-[11px] font-mono text-white/60 flex items-center justify-between">
+                          <span className="truncate max-w-[160px]">{ev.original_filename}</span>
+                          <span>{ev.file_size ? `${Math.round(ev.file_size / 1024)} KB` : ''}</span>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </div>
@@ -1294,11 +1449,43 @@ export default function AuthorityComplaintDetailPage() {
               </button>
             </div>
             <div className="p-3 overflow-auto flex items-center justify-center max-h-[75vh]">
-              <img
-                src={`${getApiUrl(selectedEvidenceView.view_url)}${token ? `?token=${encodeURIComponent(token)}` : ''}`}
-                alt={selectedEvidenceView.original_filename}
-                className="max-h-full max-w-full object-contain rounded-2xl"
-              />
+              {(() => {
+                const media = evidenceMedia[selectedEvidenceView.id]
+                if (media?.loading) {
+                  return (
+                    <div className="py-20 flex flex-col items-center gap-3 text-white/50">
+                      <RefreshCw className="w-8 h-8 animate-spin text-[#F36B21]" />
+                      <span className="text-xs font-mono">Loading full resolution evidence...</span>
+                    </div>
+                  )
+                }
+                if (media?.error || !media?.url) {
+                  return (
+                    <div className="py-20 flex flex-col items-center gap-2 text-center">
+                      <AlertCircle className="w-10 h-10 text-red-400 mb-1" />
+                      <span className="text-sm font-semibold text-white">Unable to display evidence</span>
+                      <span className="text-xs text-white/60 font-mono">{media?.error || 'Evidence could not be retrieved.'}</span>
+                    </div>
+                  )
+                }
+                if (selectedEvidenceView.file_type?.includes('video') || media.fileType?.includes('video')) {
+                  return (
+                    <video
+                      controls
+                      autoPlay
+                      className="max-h-[72vh] max-w-full rounded-2xl bg-black"
+                      src={media.url}
+                    />
+                  )
+                }
+                return (
+                  <img
+                    src={media.url}
+                    alt={selectedEvidenceView.original_filename}
+                    className="max-h-full max-w-full object-contain rounded-2xl"
+                  />
+                )
+              })()}
             </div>
           </div>
         </div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { useParams, useLocation, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, MapPin, Clock, Calendar, CheckCircle2, AlertTriangle,
@@ -47,6 +47,145 @@ export default function DepartmentWorkOrderDetailPage() {
   const [evidenceFile, setEvidenceFile] = useState(null)
   const [evidenceCaption, setEvidenceCaption] = useState('')
   const [selectedEvidenceView, setSelectedEvidenceView] = useState(null)
+  const [evidenceMedia, setEvidenceMedia] = useState({})
+  const objectUrlsMapRef = useRef(new Map()) // evId -> objectUrl
+  const authFetchRef = useRef(authFetch)
+  authFetchRef.current = authFetch
+
+  // Key on unique identity and stored filename of evidence attachments
+  const evidenceKey = (complaint?.evidence || []).map(e => `${e.id}-${e.stored_filename}`).join(',')
+
+  // Unmount-only cleanup: revokes all created object URLs when component unmounts
+  useEffect(() => {
+    return () => {
+      objectUrlsMapRef.current.forEach((url) => {
+        try {
+          URL.revokeObjectURL(url)
+        } catch (e) {}
+      })
+      objectUrlsMapRef.current.clear()
+    }
+  }, [])
+
+  // Evidence loading effect: depends ONLY on evidenceKey (not authFetch), preventing token refresh fetch loops
+  // and preserving existing object URLs without prematurely revoking them while still displayed.
+  useEffect(() => {
+    const evidenceList = complaint?.evidence || []
+    if (evidenceList.length === 0) {
+      objectUrlsMapRef.current.forEach((url) => {
+        try {
+          URL.revokeObjectURL(url)
+        } catch (e) {}
+      })
+      objectUrlsMapRef.current.clear()
+      setEvidenceMedia({})
+      return
+    }
+
+    let isMounted = true
+
+    // Clean up URLs for evidence items that were removed
+    const currentIds = new Set(evidenceList.map(e => e.id))
+    for (const [evId, url] of objectUrlsMapRef.current.entries()) {
+      if (!currentIds.has(evId)) {
+        try {
+          URL.revokeObjectURL(url)
+        } catch (e) {}
+        objectUrlsMapRef.current.delete(evId)
+      }
+    }
+
+    // Set initial loading states only for items that don't already have an active object URL
+    setEvidenceMedia((prev) => {
+      const nextMedia = { ...prev }
+      evidenceList.forEach((ev) => {
+        if (!objectUrlsMapRef.current.has(ev.id)) {
+          nextMedia[ev.id] = {
+            url: null,
+            loading: true,
+            error: null,
+            fileType: ev.file_type || ''
+          }
+        }
+      })
+      return nextMedia
+    })
+
+    // Asynchronously fetch each un-loaded attachment in parallel via authFetchRef (supports token refresh)
+    evidenceList.forEach(async (ev) => {
+      // If already loaded and active, retain existing object URL (do not re-fetch or revoke)
+      if (objectUrlsMapRef.current.has(ev.id)) {
+        return
+      }
+
+      try {
+        const res = await authFetchRef.current(ev.view_url)
+        if (!isMounted) return
+
+        if (!res.ok) {
+          let errorMsg = 'Failed to load evidence file'
+          if (res.status === 401) {
+            errorMsg = 'Authentication required'
+          } else if (res.status === 403) {
+            errorMsg = 'Access forbidden: Department restricted'
+          } else if (res.status === 404) {
+            errorMsg = 'Evidence file not found'
+          } else if (res.status >= 500) {
+            errorMsg = 'Cloud storage unavailable'
+          }
+          if (isMounted) {
+            setEvidenceMedia((prev) => ({
+              ...prev,
+              [ev.id]: {
+                url: null,
+                loading: false,
+                error: errorMsg,
+                fileType: ev.file_type || ''
+              }
+            }))
+          }
+          return
+        }
+
+        const blob = await res.blob()
+        if (!isMounted) return
+
+        const objectUrl = URL.createObjectURL(blob)
+        objectUrlsMapRef.current.set(ev.id, objectUrl)
+
+        if (isMounted) {
+          setEvidenceMedia((prev) => ({
+            ...prev,
+            [ev.id]: {
+              url: objectUrl,
+              loading: false,
+              error: null,
+              fileType: ev.file_type || blob.type || ''
+            }
+          }))
+        } else {
+          URL.revokeObjectURL(objectUrl)
+          objectUrlsMapRef.current.delete(ev.id)
+        }
+      } catch (err) {
+        if (isMounted) {
+          setEvidenceMedia((prev) => ({
+            ...prev,
+            [ev.id]: {
+              url: null,
+              loading: false,
+              error: err.message || 'Error loading evidence',
+              fileType: ev.file_type || ''
+            }
+          }))
+        }
+      }
+    })
+
+    return () => {
+      isMounted = false
+    }
+  }, [evidenceKey])
 
   // Phase 8 Resolution Submission States
   const [resWorkDesc, setResWorkDesc] = useState('')
@@ -560,28 +699,55 @@ export default function DepartmentWorkOrderDetailPage() {
 
               {complaint.evidence && complaint.evidence.length > 0 ? (
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                  {complaint.evidence.map((ev) => (
-                    <div
-                      key={ev.id}
-                      onClick={() => setSelectedEvidenceView(ev)}
-                      className="group relative rounded-2xl overflow-hidden bg-[#10131C] border border-white/[0.08] hover:border-[#F36B21]/50 transition-all cursor-pointer shadow-xs aspect-video flex flex-col justify-end"
-                    >
-                      <img
-                        src={getApiUrl(ev.view_url)}
-                        alt={ev.original_filename}
-                        className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                        onError={(e) => {
-                          e.target.style.display = 'none'
-                        }}
-                      />
-                      <div className="relative z-10 p-2.5 bg-gradient-to-t from-black/90 via-black/50 to-transparent">
-                        <p className="text-[11px] font-semibold text-white truncate">{ev.original_filename}</p>
-                        <p className="text-[9px] text-[#A1A1AA] font-mono">
-                          {ev.file_size ? `${Math.round(ev.file_size / 1024)} KB` : 'Evidence photo'}
-                        </p>
+                  {complaint.evidence.map((ev) => {
+                    const media = evidenceMedia[ev.id]
+                    const isVideo = ev.file_type?.includes('video') || media?.fileType?.includes('video')
+
+                    return (
+                      <div
+                        key={ev.id}
+                        onClick={() => setSelectedEvidenceView(ev)}
+                        className="group relative rounded-2xl overflow-hidden bg-[#10131C] border border-white/[0.08] hover:border-[#F36B21]/50 transition-all cursor-pointer shadow-xs aspect-video flex flex-col justify-end"
+                      >
+                        {media?.loading ? (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 text-white/40">
+                            <RefreshCw className="w-5 h-5 animate-spin text-[#F36B21]" />
+                            <span className="text-[10px] font-mono">Loading...</span>
+                          </div>
+                        ) : media?.error || !media?.url ? (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center p-2 text-center bg-red-950/20">
+                            <AlertCircle className="w-5 h-5 text-red-400 mb-1" />
+                            <span className="text-[10px] font-medium text-red-300">Load failed</span>
+                            <span className="text-[9px] text-white/40 font-mono truncate max-w-full">{media?.error || 'Unavailable'}</span>
+                          </div>
+                        ) : isVideo ? (
+                          <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+                            <video
+                              src={media.url}
+                              className="w-full h-full object-cover"
+                              muted
+                              playsInline
+                            />
+                            <div className="absolute inset-0 flex items-center justify-center bg-black/30">
+                              <span className="p-2 rounded-full bg-black/70 text-white text-xs">▶</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <img
+                            src={media.url}
+                            alt={ev.original_filename}
+                            className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                          />
+                        )}
+                        <div className="relative z-10 p-2.5 bg-gradient-to-t from-black/90 via-black/50 to-transparent">
+                          <p className="text-[11px] font-semibold text-white truncate">{ev.original_filename}</p>
+                          <p className="text-[9px] text-[#A1A1AA] font-mono">
+                            {ev.file_size ? `${Math.round(ev.file_size / 1024)} KB` : 'Evidence photo'}
+                          </p>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               ) : (
                 <div className="py-8 rounded-2xl bg-[#10131C] border border-white/[0.08] text-center">
@@ -997,11 +1163,43 @@ export default function DepartmentWorkOrderDetailPage() {
               </button>
             </div>
             <div className="p-4 bg-black/50 flex items-center justify-center max-h-[75vh] overflow-hidden">
-              <img
-                src={`${getApiUrl(selectedEvidenceView.view_url)}${token ? `?token=${encodeURIComponent(token)}` : ''}`}
-                alt={selectedEvidenceView.original_filename}
-                className="max-h-[70vh] w-auto object-contain rounded-xl"
-              />
+              {(() => {
+                const media = evidenceMedia[selectedEvidenceView.id]
+                if (media?.loading) {
+                  return (
+                    <div className="py-16 flex flex-col items-center gap-2 text-white/50">
+                      <RefreshCw className="w-7 h-7 animate-spin text-[#F36B21]" />
+                      <span className="text-xs font-mono">Loading evidence...</span>
+                    </div>
+                  )
+                }
+                if (media?.error || !media?.url) {
+                  return (
+                    <div className="py-16 flex flex-col items-center gap-2 text-center">
+                      <AlertCircle className="w-8 h-8 text-red-400 mb-1" />
+                      <span className="text-xs font-semibold text-white">Unable to display evidence</span>
+                      <span className="text-[11px] text-[#A1A1AA] font-mono">{media?.error || 'Evidence could not be retrieved.'}</span>
+                    </div>
+                  )
+                }
+                if (selectedEvidenceView.file_type?.includes('video') || media.fileType?.includes('video')) {
+                  return (
+                    <video
+                      controls
+                      autoPlay
+                      className="max-h-[70vh] w-auto rounded-xl bg-black"
+                      src={media.url}
+                    />
+                  )
+                }
+                return (
+                  <img
+                    src={media.url}
+                    alt={selectedEvidenceView.original_filename}
+                    className="max-h-[70vh] w-auto object-contain rounded-xl"
+                  />
+                )
+              })()}
             </div>
           </div>
         </div>
