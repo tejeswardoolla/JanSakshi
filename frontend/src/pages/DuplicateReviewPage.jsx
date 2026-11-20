@@ -176,7 +176,7 @@ export default function DuplicateReviewPage() {
           <span className="text-xs font-bold text-[#A1A1AA] uppercase tracking-wider mr-2 flex items-center gap-1.5">
             <Filter size={12} /> Status:
           </span>
-          {['pending', 'approved', 'rejected'].map((s) => (
+          {['pending', 'approved', 'rejected', 'dismissed'].map((s) => (
             <button
               key={s}
               onClick={() => setStatusFilter(s)}
@@ -231,7 +231,11 @@ export default function DuplicateReviewPage() {
               description: item.complaint_description || match.complaint?.description,
               latitude: item.complaint_latitude ?? match.complaint?.latitude,
               longitude: item.complaint_longitude ?? match.complaint?.longitude,
-              location_source: match.complaint?.location_source || 'gps'
+              location_source: match.complaint?.location_source || 'gps',
+              citizen_name: item.citizen_name,
+              citizen_email: item.citizen_email,
+              submission_channel: item.submission_channel || 'website',
+              evidence_count: item.evidence_count || 0,
             }
             const issue = match.candidate_issue || match.physical_issue || {}
             const isPending = match.review_status === 'pending'
@@ -249,7 +253,7 @@ export default function DuplicateReviewPage() {
                       Match #{match.id}
                     </span>
                     <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-white/10 text-[#F5F5F5]">
-                      Score: {(match.similarity_score * 100).toFixed(0)}% ({match.confidence_level})
+                      Composite: {(match.similarity_score * 100).toFixed(0)}% ({match.confidence_level})
                     </span>
                     <span
                       className={`text-xs px-2.5 py-0.5 rounded-full font-semibold uppercase ${
@@ -257,6 +261,8 @@ export default function DuplicateReviewPage() {
                           ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                           : match.review_status === 'rejected'
                           ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                          : match.review_status === 'dismissed'
+                          ? 'bg-zinc-500/20 text-zinc-400 border border-zinc-500/30'
                           : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                       }`}
                     >
@@ -285,10 +291,27 @@ export default function DuplicateReviewPage() {
                       {comp.description}
                     </p>
 
-                    <div className="pt-2 border-t border-white/5 flex items-center gap-1.5 text-xs text-[#A1A1AA]">
-                      <MapPin size={12} className="text-zinc-500" />
-                      <span>{comp.latitude ? `${comp.latitude.toFixed(4)}, ${comp.longitude.toFixed(4)}` : 'No GPS'}</span>
-                      <span className="text-[10px] text-zinc-500 ml-auto capitalize">{comp.location_source}</span>
+                    <div className="pt-2 border-t border-white/5 space-y-1.5 text-xs text-[#A1A1AA]">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] text-zinc-400">Citizen:</span>
+                        <span className="text-zinc-200 font-medium truncate max-w-[200px]">
+                          {comp.citizen_name || 'Anonymous'} {comp.citizen_email ? `(${comp.citizen_email})` : ''}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] text-zinc-400">Channel:</span>
+                        <span className="text-xs uppercase font-mono px-2 py-0.5 rounded bg-white/5 text-zinc-300">
+                          {comp.submission_channel}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="flex items-center gap-1 text-[11px] text-zinc-400">
+                          <MapPin size={11} className="text-zinc-500" /> Location:
+                        </span>
+                        <span className="text-zinc-300 font-mono text-[11px]">
+                          {comp.latitude ? `${comp.latitude.toFixed(4)}, ${comp.longitude.toFixed(4)}` : 'No GPS'}
+                        </span>
+                      </div>
                     </div>
                   </div>
 
@@ -306,10 +329,68 @@ export default function DuplicateReviewPage() {
                       Status: <strong className="text-[#F5F5F5]">{issue.current_status}</strong> • Linked Complaints: <strong className="text-[#F5F5F5]">{issue.complaint_count || issue.complaints?.length || 1}</strong>
                     </div>
 
-                    <div className="pt-2 border-t border-white/5 flex items-center gap-1.5 text-xs text-[#A1A1AA]">
-                      <MapPin size={12} className="text-zinc-500" />
-                      <span>{issue.representative_location || 'Municipal Geocoded Marker'}</span>
+                    <div className="pt-2 border-t border-white/5 space-y-1.5 text-xs text-[#A1A1AA]">
+                      <div className="flex items-center justify-between">
+                        <span className="flex items-center gap-1 text-[11px] text-zinc-400">
+                          <MapPin size={11} className="text-zinc-500" /> Marker:
+                        </span>
+                        <span className="text-zinc-300 text-[11px] truncate max-w-[200px]">
+                          {issue.representative_location || 'Municipal Geocoded Marker'}
+                        </span>
+                      </div>
+
+                      {issue.associated_complaints && issue.associated_complaints.length > 0 && (
+                        <div className="pt-1.5 border-t border-white/5 space-y-1">
+                          <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                            Previously Linked Reports ({issue.associated_complaints.length}):
+                          </span>
+                          <div className="space-y-1 max-h-24 overflow-y-auto pr-1">
+                            {issue.associated_complaints.map((c) => (
+                              <div key={c.complaint_id} className="text-[11px] text-zinc-300 flex items-center justify-between bg-black/40 px-2 py-1 rounded-lg border border-white/5">
+                                <span className="font-mono text-sky-300 font-semibold">{c.complaint_id}</span>
+                                <span className="text-zinc-400 text-[10px] truncate max-w-[140px]">
+                                  {c.citizen_email || c.citizen_name || 'Citizen'}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
+                  </div>
+                </div>
+
+                {/* Multi-Signal Breakdown */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1">
+                  <div className="bg-[#10131C] border border-white/5 p-2.5 rounded-xl text-center">
+                    <div className="text-[10px] uppercase font-bold text-zinc-500">GPS Distance</div>
+                    <div className="text-xs font-bold text-zinc-200 mt-0.5">
+                      {match.gps_distance_meters != null ? `${match.gps_distance_meters.toFixed(1)}m` : 'N/A'}
+                    </div>
+                    <div className="text-[10px] text-zinc-400">
+                      {match.gps_similarity != null ? `${(match.gps_similarity * 100).toFixed(0)}% score` : ''}
+                    </div>
+                  </div>
+                  <div className="bg-[#10131C] border border-white/5 p-2.5 rounded-xl text-center">
+                    <div className="text-[10px] uppercase font-bold text-zinc-500">Text Match</div>
+                    <div className="text-xs font-bold text-zinc-200 mt-0.5">
+                      {match.text_similarity != null ? `${(match.text_similarity * 100).toFixed(0)}%` : 'N/A'}
+                    </div>
+                    <div className="text-[10px] text-zinc-400">Semantic & TF-IDF</div>
+                  </div>
+                  <div className="bg-[#10131C] border border-white/5 p-2.5 rounded-xl text-center">
+                    <div className="text-[10px] uppercase font-bold text-zinc-500">Image Similarity</div>
+                    <div className="text-xs font-bold text-zinc-200 mt-0.5">
+                      {match.image_similarity != null ? `${(match.image_similarity * 100).toFixed(0)}%` : 'No Image / N/A'}
+                    </div>
+                    <div className="text-[10px] text-zinc-400">Perceptual Hash</div>
+                  </div>
+                  <div className="bg-[#10131C] border border-white/5 p-2.5 rounded-xl text-center">
+                    <div className="text-[10px] uppercase font-bold text-zinc-500">Category Match</div>
+                    <div className="text-xs font-bold text-zinc-200 mt-0.5">
+                      {match.category_similarity != null ? `${(match.category_similarity * 100).toFixed(0)}%` : 'N/A'}
+                    </div>
+                    <div className="text-[10px] text-zinc-400">Domain Taxonomy</div>
                   </div>
                 </div>
 
@@ -319,6 +400,11 @@ export default function DuplicateReviewPage() {
                     <Info size={13} /> Matching Analysis
                   </div>
                   <p className="text-[#A1A1AA] leading-relaxed">{match.matching_explanation}</p>
+                  {match.warning_signals && (
+                    <p className="text-amber-400 text-[11px] mt-1 flex items-center gap-1">
+                      <AlertTriangle size={12} /> {match.warning_signals}
+                    </p>
+                  )}
                 </div>
 
                 {/* Actions (for Pending matches) */}

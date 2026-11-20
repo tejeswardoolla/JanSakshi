@@ -1,10 +1,15 @@
 from typing import List, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException
 
 from app.models.complaint import PhysicalIssue, Complaint
 from app.repositories import PhysicalIssueRepository, ComplaintRepository
-from app.services.issue_id_service import generate_issue_reference_id
+from app.services.issue_id_service import (
+    generate_issue_reference_id,
+    _issue_id_seq_mutex,
+    is_issue_reference_id_collision,
+)
 
 class PhysicalIssueService:
     def __init__(self, db: Session):
@@ -20,19 +25,34 @@ class PhysicalIssueService:
         description: str,
         representative_location: Optional[str] = None
     ) -> PhysicalIssue:
-        issue_ref = generate_issue_reference_id(self.db)
-        issue = self.issue_repo.create({
-            "issue_reference_id": issue_ref,
-            "category": category.strip(),
-            "representative_latitude": representative_latitude,
-            "representative_longitude": representative_longitude,
-            "representative_location": representative_location.strip() if representative_location else None,
-            "description": description.strip(),
-            "current_status": "Open"
-        })
-        self.db.commit()
-        self.db.refresh(issue)
-        return issue
+        with _issue_id_seq_mutex:
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    issue_ref = generate_issue_reference_id(self.db)
+                    issue = self.issue_repo.create({
+                        "issue_reference_id": issue_ref,
+                        "category": category.strip(),
+                        "representative_latitude": representative_latitude,
+                        "representative_longitude": representative_longitude,
+                        "representative_location": representative_location.strip() if representative_location else None,
+                        "description": description.strip(),
+                        "current_status": "Open"
+                    })
+                    self.db.commit()
+                except IntegrityError as err:
+                    self.db.rollback()
+                    # Retry ONLY if positively identified as an issue_reference_id uniqueness collision
+                    if is_issue_reference_id_collision(err) and attempt < max_attempts - 1:
+                        continue
+                    raise
+                except Exception:
+                    self.db.rollback()
+                    raise
+
+                # Successfully committed to database; do NOT retry create operation
+                self.db.refresh(issue)
+                return issue
 
     def get_issue(self, issue_reference_id: str) -> PhysicalIssue:
         issue = self.issue_repo.get_by_reference_id(issue_reference_id)

@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.complaint import Complaint, PhysicalIssue, DuplicateMatch
-from app.core.security import require_roles
+from app.core.security import require_roles, oauth2_scheme, get_user_from_token_str
 from app.models.authority import User
 from app.services.duplicate_detection import DuplicateDetector
 from app.schemas import (
@@ -17,9 +17,23 @@ from app.schemas import (
 
 router = APIRouter(prefix="/api/duplicates", tags=["Duplicate Detection"])
 
-def _format_match_response(match: DuplicateMatch) -> DuplicateMatchResponse:
+def _format_match_response(match: DuplicateMatch, include_pii: bool = False) -> DuplicateMatchResponse:
     cand_issue = None
     if match.physical_issue:
+        associated_ids = [c.complaint_id for c in match.physical_issue.complaints]
+        associated_comps = []
+        for c in match.physical_issue.complaints:
+            comp_data = {
+                "complaint_id": c.complaint_id,
+                "submission_channel": c.submission_channel,
+                "category": c.category,
+                "description": c.description,
+            }
+            if include_pii:
+                comp_data["citizen_name"] = c.citizen_name
+                comp_data["citizen_email"] = c.citizen_email
+            associated_comps.append(comp_data)
+
         cand_issue = PhysicalIssueResponse(
             id=match.physical_issue.id,
             issue_reference_id=match.physical_issue.issue_reference_id,
@@ -32,6 +46,8 @@ def _format_match_response(match: DuplicateMatch) -> DuplicateMatchResponse:
             created_at=match.physical_issue.created_at,
             updated_at=match.physical_issue.updated_at,
             complaint_count=len(match.physical_issue.complaints),
+            associated_complaint_ids=associated_ids,
+            associated_complaints=associated_comps,
         )
     return DuplicateMatchResponse(
         id=match.id,
@@ -59,14 +75,23 @@ def _format_match_response(match: DuplicateMatch) -> DuplicateMatchResponse:
 @router.get("/complaints/{complaint_id}", response_model=List[DuplicateMatchResponse])
 async def get_complaint_duplicate_candidates(
     complaint_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    token: Optional[str] = Depends(oauth2_scheme)
 ):
     """
     Retrieve candidate physical issue duplicate matches for a given citizen complaint.
+    Public/unauthenticated requests strip citizen PII (citizen name, email).
+    Only authenticated admin/authority users receive associated citizen identity details.
     """
     complaint = db.query(Complaint).filter(Complaint.complaint_id == complaint_id.strip()).first()
     if not complaint:
         raise HTTPException(status_code=404, detail=f"Complaint '{complaint_id}' not found.")
+
+    is_admin = False
+    if token:
+        user = get_user_from_token_str(token, db)
+        if user and user.role in ("admin", "authority"):
+            is_admin = True
 
     matches = (
         db.query(DuplicateMatch)
@@ -74,7 +99,7 @@ async def get_complaint_duplicate_candidates(
         .order_by(DuplicateMatch.similarity_score.desc())
         .all()
     )
-    return [_format_match_response(m) for m in matches]
+    return [_format_match_response(m, include_pii=is_admin) for m in matches]
 
 @router.get("/review-queue", response_model=List[DuplicateReviewQueueItem])
 async def get_duplicate_review_queue(
@@ -89,10 +114,10 @@ async def get_duplicate_review_queue(
     """
     query = db.query(DuplicateMatch).join(Complaint, DuplicateMatch.complaint_id == Complaint.complaint_id)
 
-    if status_filter != "all":
+    if status_filter and isinstance(status_filter, str) and status_filter != "all":
         query = query.filter(DuplicateMatch.review_status == status_filter)
 
-    if confidence:
+    if confidence and isinstance(confidence, str):
         query = query.filter(DuplicateMatch.confidence_level == confidence.lower())
 
     matches = query.order_by(DuplicateMatch.similarity_score.desc(), DuplicateMatch.created_at.desc()).all()
@@ -102,13 +127,16 @@ async def get_duplicate_review_queue(
         comp = m.complaint
         queue_items.append(
             DuplicateReviewQueueItem(
-                match=_format_match_response(m),
+                match=_format_match_response(m, include_pii=True),
                 complaint_category=comp.category,
                 complaint_description=comp.description,
                 complaint_latitude=comp.latitude,
                 complaint_longitude=comp.longitude,
                 complaint_created_at=comp.created_at,
                 evidence_count=len(comp.evidence_files),
+                citizen_name=comp.citizen_name,
+                citizen_email=comp.citizen_email,
+                submission_channel=comp.submission_channel,
             )
         )
     return queue_items
@@ -138,6 +166,7 @@ async def approve_duplicate_candidate(
             complaint_id=result["complaint_id"],
             issue_reference_id=result["issue_reference_id"],
             review_status=result["review_status"],
+            dismissed_sibling_count=result.get("dismissed_sibling_count", 0),
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
