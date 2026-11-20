@@ -853,6 +853,9 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         # Part A: Test _create_provisional_anchor directly with a PostgreSQL session where lock acquisition fails
         mock_pg_db = MagicMock()
         mock_pg_db.get_bind.return_value.dialect.name = "postgresql"
+        mock_conn = MagicMock()
+        mock_pg_db.get_bind.return_value.connect.return_value = mock_conn
+        mock_conn.execute.side_effect = OperationalError("statement timeout", params={}, orig=Exception("Lock Timeout"))
         mock_pg_db.execute.side_effect = OperationalError("statement timeout", params={}, orig=Exception("Lock Timeout"))
 
         c_pg = Complaint(
@@ -1870,7 +1873,7 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         """44. Spatial advisory lock is reacquired after a failed transaction collision rollback before retry."""
         from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
         from sqlalchemy.exc import IntegrityError
-        from sqlalchemy import text
+        from sqlalchemy.engine import Connection
 
         complaint = self._create_test_complaint(
             citizen_id="citizen-reacquire-1",
@@ -1887,14 +1890,14 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         )
 
         lock_calls = []
-        real_execute = self.db.execute
+        orig_conn_execute = Connection.execute
 
-        def spy_execute(statement, *args, **kwargs):
+        def spy_conn_execute(conn_self, statement, *args, **kwargs):
             stmt_str = str(statement)
             if "pg_advisory_xact_lock" in stmt_str:
-                lock_calls.append(kwargs.get("params") or args)
+                lock_calls.append(kwargs.get("params") or (args[0] if args else {}))
                 return MagicMock()
-            return real_execute(statement, *args, **kwargs)
+            return orig_conn_execute(conn_self, statement, *args, **kwargs)
 
         attempt = 0
         real_commit = self.db.commit
@@ -1906,12 +1909,12 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
             return real_commit()
 
         with patch("app.services.issue_id_service.get_verified_database_dialect", return_value="postgresql"):
-            with patch.object(self.db, "execute", side_effect=spy_execute):
+            with patch.object(Connection, "execute", side_effect=spy_conn_execute, autospec=True):
                 with patch.object(self.db, "commit", side_effect=side_effect_commit):
                     anchor = DuplicateDetector._create_provisional_anchor(complaint, self.db)
                     self.assertIsNotNone(anchor)
 
-        # In PostgreSQL, pg_advisory_xact_lock must be acquired on attempt 1 AND reacquired on attempt 2 after rollback!
+        # In PostgreSQL, dedicated pg_advisory_xact_lock must be acquired on attempt 1 AND reacquired on attempt 2 after collision rollback!
         self.assertGreaterEqual(
             len(lock_calls),
             2,
@@ -1962,6 +1965,7 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         """46. Boundary coordinates (e.g. 16.10004 vs 16.10006) share unified advisory lock and resolve to 1 anchor."""
         from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
         from app.models.complaint import PhysicalIssue
+        from sqlalchemy.engine import Connection
 
         # 16.10004 and 16.10006 are ~2.2 metres apart, well within tolerance 0.0001 deg (~11 metres)
         # Old 4-decimal formatting: 16.10004 -> "16.1000", 16.10006 -> "16.1001" (split lock keys)
@@ -1970,19 +1974,19 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         c2 = self._create_test_complaint("cit-bound-2", "Sanitation", 16.10006, 80.10006, "Garbage at boundary 2")
 
         lock_keys_used = []
-        real_execute = self.db.execute
+        orig_conn_execute = Connection.execute
 
-        def spy_execute(statement, *args, **kwargs):
+        def spy_conn_execute(conn_self, statement, *args, **kwargs):
             stmt_str = str(statement)
             if "pg_advisory_xact_lock" in stmt_str:
                 params = kwargs.get("params") or (args[0] if args else {})
                 if isinstance(params, dict) and "k" in params:
                     lock_keys_used.append(params["k"])
                 return MagicMock()
-            return real_execute(statement, *args, **kwargs)
+            return orig_conn_execute(conn_self, statement, *args, **kwargs)
 
         with patch("app.services.issue_id_service.get_verified_database_dialect", return_value="postgresql"):
-            with patch.object(self.db, "execute", side_effect=spy_execute):
+            with patch.object(Connection, "execute", side_effect=spy_conn_execute, autospec=True):
                 anchor1 = DuplicateDetector._create_provisional_anchor(c1, self.db)
                 anchor2 = DuplicateDetector._create_provisional_anchor(c2, self.db)
 
@@ -2128,13 +2132,21 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
 
             verify_sess.refresh(comp_db2)
             self.assertEqual(comp_db2.issue_id, canonical_ref, "Complaint must only be associated after authority approval")
+
+            # Verify advisory lock is completely released and not held after evaluate_complaint
+            with test_pg_engine.connect() as probe_conn:
+                lock_probe = probe_conn.execute(
+                    text("SELECT pg_try_advisory_xact_lock(hashtext('jansakshi_provisional_anchor_mutex'))")
+                ).scalar()
+                self.assertTrue(lock_probe, "PostgreSQL advisory lock must be released after anchor evaluation")
         finally:
             verify_sess.close()
 
     def test_48_advisory_lock_released_immediately_on_existing_anchor_return(self):
-        """48. When an existing anchor is found, read transaction is committed to release pg_advisory_xact_lock immediately."""
+        """48. When an existing anchor is found, dedicated advisory lock is released immediately without committing caller session."""
         from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
         from app.models.complaint import PhysicalIssue
+        from sqlalchemy.engine import Connection
 
         # Pre-seed an existing PhysicalIssue anchor
         anchor_id = "ISSUE-2026-LOCK-REL-01"
@@ -2162,43 +2174,60 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         )
 
         commit_count = 0
+        rollback_count = 0
         real_commit = self.db.commit
-        real_execute = self.db.execute
+        real_rollback = self.db.rollback
 
         def spy_commit():
             nonlocal commit_count
             commit_count += 1
             real_commit()
 
-        def spy_execute(statement, *args, **kwargs):
+        def spy_rollback():
+            nonlocal rollback_count
+            rollback_count += 1
+            real_rollback()
+
+        orig_conn_execute = Connection.execute
+        lock_handles_released = []
+        orig_release = DuplicateDetector._release_spatial_lock
+
+        def spy_release_spatial_lock(handle):
+            if handle is not None:
+                lock_handles_released.append(handle)
+            orig_release(handle)
+
+        def spy_conn_execute(conn_self, statement, *args, **kwargs):
             stmt_str = str(statement)
             if "pg_advisory" in stmt_str:
                 return MagicMock()
-            return real_execute(statement, *args, **kwargs)
+            return orig_conn_execute(conn_self, statement, *args, **kwargs)
 
         with patch("app.services.issue_id_service.get_verified_database_dialect", return_value="postgresql"):
-            with patch.object(self.db, "execute", side_effect=spy_execute):
-                with patch.object(self.db, "commit", side_effect=spy_commit):
-                    # Call _create_provisional_anchor
-                    returned_anchor = DuplicateDetector._create_provisional_anchor(c_new, self.db)
+            with patch.object(Connection, "execute", side_effect=spy_conn_execute, autospec=True):
+                with patch.object(DuplicateDetector, "_release_spatial_lock", side_effect=spy_release_spatial_lock):
+                    with patch.object(self.db, "commit", side_effect=spy_commit):
+                        with patch.object(self.db, "rollback", side_effect=spy_rollback):
+                            returned_anchor = DuplicateDetector._create_provisional_anchor(c_new, self.db)
 
         # Confirm returned anchor is the pre-existing anchor
         self.assertEqual(returned_anchor.issue_reference_id, anchor_id)
         # Confirm complaint was NOT auto-linked
         self.assertIsNone(c_new.issue_id)
 
-        # Crucial check: db.commit() MUST have been called by _release_read_lock_if_clean()
-        # to terminate the read transaction and release pg_advisory_xact_lock in PostgreSQL!
-        self.assertGreaterEqual(
-            commit_count,
-            1,
-            "Expected db.commit() to be called on clean read transaction to release pg_advisory_xact_lock before returning"
-        )
+        # Dedicated lock handle MUST have been released immediately!
+        self.assertEqual(len(lock_handles_released), 1, "Dedicated spatial lock must be released when existing anchor is found")
+        self.assertTrue(lock_handles_released[0].released, "Lock handle must be in released state")
+
+        # Crucial check: caller session db.commit() and db.rollback() MUST NOT be called!
+        self.assertEqual(commit_count, 0, "Caller session db.commit() must NOT be called when returning existing anchor")
+        self.assertEqual(rollback_count, 0, "Caller session db.rollback() must NOT be called when returning existing anchor")
 
     def test_49_unrelated_pending_change_not_accidentally_committed_on_existing_anchor_return(self):
         """49. An unrelated uncommitted caller write is NOT committed when returning an existing anchor, while lock is released."""
         from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
         from app.models.complaint import Complaint, PhysicalIssue
+        from sqlalchemy.engine import Connection
 
         # 1. Pre-seed and commit an unrelated complaint in the database
         c_unrelated = self._create_test_complaint(
@@ -2241,26 +2270,32 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         c_unrelated_in_sess.description = "MODIFIED UNCOMMITTED BY CALLER"
         self.assertTrue(self.db.is_modified(c_unrelated_in_sess))
 
-        # 5. Spy on commit and advisory unlock execution
+        # 5. Spy on commit, rollback, and dedicated lock release
         commit_calls = []
         real_commit = self.db.commit
         def spy_commit():
             commit_calls.append(True)
             real_commit()
 
-        execute_calls = []
-        real_execute = self.db.execute
-        def spy_execute(statement, *args, **kwargs):
+        lock_handles_released = []
+        orig_release = DuplicateDetector._release_spatial_lock
+        def spy_release_spatial_lock(handle):
+            if handle is not None:
+                lock_handles_released.append(handle)
+            orig_release(handle)
+
+        orig_conn_execute = Connection.execute
+        def spy_conn_execute(conn_self, statement, *args, **kwargs):
             stmt_str = str(statement)
             if "pg_advisory" in stmt_str:
-                execute_calls.append(stmt_str)
                 return MagicMock()
-            return real_execute(statement, *args, **kwargs)
+            return orig_conn_execute(conn_self, statement, *args, **kwargs)
 
         with patch("app.services.issue_id_service.get_verified_database_dialect", return_value="postgresql"):
-            with patch.object(self.db, "execute", side_effect=spy_execute):
-                with patch.object(self.db, "commit", side_effect=spy_commit):
-                    returned_anchor = DuplicateDetector._create_provisional_anchor(c_target, self.db)
+            with patch.object(Connection, "execute", side_effect=spy_conn_execute, autospec=True):
+                with patch.object(DuplicateDetector, "_release_spatial_lock", side_effect=spy_release_spatial_lock):
+                    with patch.object(self.db, "commit", side_effect=spy_commit):
+                        returned_anchor = DuplicateDetector._create_provisional_anchor(c_target, self.db)
 
         # 6. Verifications:
         # A. Existing anchor is returned
@@ -2268,7 +2303,7 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         # B. Complaint independence: target complaint is NOT auto-associated
         self.assertIsNone(c_target.issue_id)
         # C. db.commit() was NOT called on caller session because session contained uncommitted caller writes!
-        self.assertEqual(len(commit_calls), 0, "db.commit() must NOT be called when session has uncommitted caller writes")
+        self.assertEqual(len(commit_calls), 0, "db.commit() must NOT be called on caller session when returning existing anchor")
         # D. In database, unrelated complaint description remains the original committed value!
         from sqlalchemy.orm import sessionmaker
         independent_sess = sessionmaker(bind=self.db.get_bind())()
@@ -2281,9 +2316,12 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
             )
         finally:
             independent_sess.close()
-        # E. Advisory unlock was executed to release the PostgreSQL advisory lock before returning
-        unlock_executed = any("pg_advisory_unlock" in s for s in execute_calls)
-        self.assertTrue(unlock_executed, "PostgreSQL advisory unlock must be executed before returning to release mutex")
+        # E. In caller session, the uncommitted write is preserved and still modified
+        self.assertEqual(c_unrelated_in_sess.description, "MODIFIED UNCOMMITTED BY CALLER")
+        self.assertTrue(self.db.is_modified(c_unrelated_in_sess))
+        # F. Dedicated lock handle was released immediately
+        self.assertEqual(len(lock_handles_released), 1, "Dedicated spatial lock must be released immediately")
+        self.assertTrue(lock_handles_released[0].released, "Dedicated lock handle must be marked as released")
 
 
 if __name__ == "__main__":

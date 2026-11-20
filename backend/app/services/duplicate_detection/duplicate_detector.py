@@ -22,6 +22,35 @@ logger = logging.getLogger("jansakshi.duplicate_detection")
 # Application-level re-entrant mutex to serialize anchor creation across concurrent worker threads
 _anchor_creation_lock = threading.RLock()
 
+
+class _SpatialLockHandle:
+    """Encapsulates a dedicated PostgreSQL transaction-scoped advisory lock connection."""
+    def __init__(self, conn, trans, lock_key: str):
+        self.conn = conn
+        self.trans = trans
+        self.lock_key = lock_key
+        self.released = False
+
+    def release(self) -> None:
+        if not self.released:
+            self.released = True
+            if self.trans is not None:
+                try:
+                    self.trans.commit()
+                except Exception:
+                    try:
+                        self.trans.rollback()
+                    except Exception:
+                        pass
+                self.trans = None
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+
+
 class DuplicateDetector:
     """
     Phase 5 Intelligent Duplicate Detection Service:
@@ -30,11 +59,60 @@ class DuplicateDetector:
     """
 
     @classmethod
+    def _open_dedicated_spatial_lock(cls, db: Session, complaint_id: str) -> Optional[_SpatialLockHandle]:
+        """
+        Acquires a unified transaction-level PostgreSQL advisory lock on a dedicated short-lived
+        connection from the application's verified engine.
+        Keeps the lock transaction independent of the application session, allowing clean lock
+        release on both existing-anchor return and collision recovery without prematurely committing
+        or rolling back uncommitted caller-session writes.
+        """
+        from app.services.issue_id_service import get_verified_database_dialect
+        dialect_name = get_verified_database_dialect(db)
+        if dialect_name == "postgresql":
+            lock_key = "jansakshi_provisional_anchor_mutex"
+            bind = db.get_bind()
+            conn = None
+            trans = None
+            try:
+                conn = bind.connect()
+                trans = conn.begin()
+                conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": lock_key})
+                return _SpatialLockHandle(conn, trans, lock_key)
+            except Exception as lock_err:
+                if trans is not None:
+                    try:
+                        trans.rollback()
+                    except Exception:
+                        pass
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                logger.error(
+                    f"PostgreSQL advisory lock acquisition failed for anchor creation on {complaint_id}: {lock_err}"
+                )
+                db.rollback()
+                raise RuntimeError(
+                    f"PostgreSQL advisory lock acquisition failed for provisional anchor creation ({complaint_id}): {lock_err}"
+                ) from lock_err
+        return None
+
+    @classmethod
+    def _release_spatial_lock(cls, lock_handle: Optional[_SpatialLockHandle]) -> None:
+        """Safely ends the dedicated lock transaction and returns connection to pool."""
+        if lock_handle is not None:
+            lock_handle.release()
+
+    @classmethod
     def _create_provisional_anchor(cls, complaint: Complaint, db: Session) -> PhysicalIssue:
         """
         Creates or links an idempotent provisional PhysicalIssue anchor for a geolocated complaint.
         Concurrency-safe across threads (process mutex) and distributed instances (PostgreSQL transaction lock).
         Guarantees that simultaneous requests cannot produce duplicate physical issue anchors.
+        Uses a dedicated short-lived PostgreSQL connection for advisory locking to ensure the mutex is
+        released immediately after canonical anchor resolution without mutating or committing caller state.
         """
         lat_tol = 0.0001
         lon_tol = 0.0001
@@ -52,26 +130,9 @@ class DuplicateDetector:
             # Distributed advisory transaction lock for PostgreSQL / Neon
             from app.services.issue_id_service import (
                 generate_issue_reference_id,
-                get_verified_database_dialect,
                 _issue_id_seq_mutex,
                 is_issue_reference_id_collision,
             )
-
-            dialect_name = get_verified_database_dialect(db)
-
-            def _acquire_spatial_lock() -> None:
-                if dialect_name == "postgresql":
-                    lock_key = "jansakshi_provisional_anchor_mutex"
-                    try:
-                        db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": lock_key})
-                    except Exception as lock_err:
-                        logger.error(
-                            f"PostgreSQL advisory lock acquisition failed for anchor creation on {complaint_id}: {lock_err}"
-                        )
-                        db.rollback()
-                        raise RuntimeError(
-                            f"PostgreSQL advisory lock acquisition failed for provisional anchor creation ({complaint_id}): {lock_err}"
-                        ) from lock_err
 
             def _find_existing_exact_anchor() -> Optional[PhysicalIssue]:
                 if target_lat is not None and target_lon is not None:
@@ -89,125 +150,101 @@ class DuplicateDetector:
                         raise
                 return None
 
-            def _is_session_clean() -> bool:
-                if bool(db.dirty or db.new or db.deleted):
-                    return False
-                for obj in db.identity_map.values():
-                    if db.is_modified(obj):
-                        return False
-                trans = db.get_transaction()
-                if trans and (
-                    bool(getattr(trans, "_dirty", None)) or
-                    bool(getattr(trans, "_new", None)) or
-                    bool(getattr(trans, "_deleted", None))
-                ):
-                    return False
-                return True
+            lock_handle: Optional[_SpatialLockHandle] = None
 
-            def _release_read_lock_if_clean() -> None:
-                """
-                In PostgreSQL, pg_advisory_xact_lock is bound to the transaction lifecycle.
-                When returning an existing anchor without mutating data, end the read transaction
-                so the advisory mutex is immediately released prior to downstream candidate
-                evaluation (expensive text/image similarity scoring).
-                Only commits if there is no pending uncommitted caller state (not db.dirty, db.new, db.deleted,
-                and no flushed/modified objects in identity map or transaction).
-                If uncommitted caller state is detected, avoids committing to protect caller writes,
-                and executes explicit advisory unlock.
-                """
-                if dialect_name == "postgresql":
-                    lock_key = "jansakshi_provisional_anchor_mutex"
-                    try:
-                        db.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": lock_key})
-                    except Exception:
-                        pass
-                    if _is_session_clean():
-                        db.commit()
+            try:
+                # 1. Acquire PostgreSQL advisory transaction lock on a dedicated connection
+                lock_handle = cls._open_dedicated_spatial_lock(db, complaint_id)
 
-            # Acquire spatial lock before checking existing anchor or allocating a new anchor
-            _acquire_spatial_lock()
+                # 2. Check if an anchor already exists at the coordinates and category
+                # Wrapping in no_autoflush prevents prematurely flushing uncommitted caller writes
+                existing_exact = _find_existing_exact_anchor()
+                if existing_exact:
+                    # End the dedicated lock transaction immediately.
+                    # Do NOT commit or roll back db, preserving any unrelated caller-session writes!
+                    cls._release_spatial_lock(lock_handle)
+                    lock_handle = None
+                    return existing_exact
 
-            # Check if an anchor already exists at the coordinates and category
-            existing_exact = _find_existing_exact_anchor()
-            if existing_exact:
-                # Do NOT automatically associate the complaint.
-                # Preserve complaint independence; return the existing anchor to be evaluated
-                # as a duplicate candidate for authority review.
-                _release_read_lock_if_clean()
-                return existing_exact
-
-            rep_location = (
-                complaint.google_maps_url
-                if complaint.google_maps_url
-                else (
-                    f"{target_lat:.4f}, {target_lon:.4f}"
-                    if target_lat is not None and target_lon is not None
-                    else "Unspecified Location"
+                rep_location = (
+                    complaint.google_maps_url
+                    if complaint.google_maps_url
+                    else (
+                        f"{target_lat:.4f}, {target_lon:.4f}"
+                        if target_lat is not None and target_lon is not None
+                        else "Unspecified Location"
+                    )
                 )
-            )
 
-            max_anchor_attempts = 3
-            with _issue_id_seq_mutex:
-                for attempt in range(max_anchor_attempts):
-                    try:
-                        issue_ref = generate_issue_reference_id(db)
+                max_anchor_attempts = 3
+                with _issue_id_seq_mutex:
+                    for attempt in range(max_anchor_attempts):
+                        try:
+                            issue_ref = generate_issue_reference_id(db)
 
-                        # Clearly identify as a provisional anchor; does not trigger automated municipal dispatch
-                        anchor = PhysicalIssue(
-                            issue_reference_id=issue_ref,
-                            category=target_category,
-                            representative_latitude=target_lat if target_lat is not None else 0.0,
-                            representative_longitude=target_lon if target_lon is not None else 0.0,
-                            representative_location=f"Provisional Cluster ({rep_location})",
-                            description=f"[Provisional Issue Anchor] {complaint.description}",
-                            current_status="Open",
-                            created_at=utc_now(),
-                            updated_at=utc_now(),
-                        )
+                            # Clearly identify as a provisional anchor; does not trigger automated municipal dispatch
+                            anchor = PhysicalIssue(
+                                issue_reference_id=issue_ref,
+                                category=target_category,
+                                representative_latitude=target_lat if target_lat is not None else 0.0,
+                                representative_longitude=target_lon if target_lon is not None else 0.0,
+                                representative_location=f"Provisional Cluster ({rep_location})",
+                                description=f"[Provisional Issue Anchor] {complaint.description}",
+                                current_status="Open",
+                                created_at=utc_now(),
+                                updated_at=utc_now(),
+                            )
 
-                        target_complaint = db.query(Complaint).filter(Complaint.complaint_id == complaint_id).first() or complaint
-                        db.add(anchor)
-                        target_complaint.issue_id = issue_ref
-                        target_complaint.updated_at = utc_now()
+                            target_complaint = db.query(Complaint).filter(Complaint.complaint_id == complaint_id).first() or complaint
+                            db.add(anchor)
+                            target_complaint.issue_id = issue_ref
+                            target_complaint.updated_at = utc_now()
 
-                        event = ComplaintEvent(
-                            complaint_id=complaint_id,
-                            event_type="provisional_issue_anchor_created",
-                            previous_value=None,
-                            new_value=issue_ref,
-                            description=f"Provisional Physical Issue anchor {issue_ref} established for geolocated complaint.",
-                            source="ai_duplicate_detector",
-                            created_at=utc_now(),
-                        )
-                        db.add(event)
-                        db.commit()
+                            event = ComplaintEvent(
+                                complaint_id=complaint_id,
+                                event_type="provisional_issue_anchor_created",
+                                previous_value=None,
+                                new_value=issue_ref,
+                                description=f"Provisional Physical Issue anchor {issue_ref} established for geolocated complaint.",
+                                source="ai_duplicate_detector",
+                                created_at=utc_now(),
+                            )
+                            db.add(event)
+                            db.commit()
 
-                    except IntegrityError as err:
-                        db.rollback()
-                        if not is_issue_reference_id_collision(err):
+                        except IntegrityError as err:
+                            db.rollback()
+                            if not is_issue_reference_id_collision(err):
+                                raise
+
+                            if attempt < max_anchor_attempts - 1:
+                                # Reacquire dedicated spatial advisory lock since retry starts a new cycle
+                                cls._release_spatial_lock(lock_handle)
+                                lock_handle = cls._open_dedicated_spatial_lock(db, complaint_id)
+
+                                existing_exact = _find_existing_exact_anchor()
+                                if existing_exact:
+                                    cls._release_spatial_lock(lock_handle)
+                                    lock_handle = None
+                                    return existing_exact
+
+                                continue
                             raise
 
-                        if attempt < max_anchor_attempts - 1:
-                            # Reacquire spatial advisory lock since transaction rollback released it in PostgreSQL
-                            _acquire_spatial_lock()
+                        except Exception:
+                            db.rollback()
+                            raise
 
-                            # Recheck whether another transaction committed an anchor at this location
-                            existing_exact = _find_existing_exact_anchor()
-                            if existing_exact:
-                                # Return the existing anchor without automatically linking the complaint;
-                                # it will be processed through the human review duplicate match workflow.
-                                _release_read_lock_if_clean()
-                                return existing_exact
+                        # Anchor creation succeeded and committed atomically on db.
+                        # Release dedicated spatial lock immediately!
+                        cls._release_spatial_lock(lock_handle)
+                        lock_handle = None
 
-                            continue
-                        raise
+                        db.refresh(anchor)
+                        return anchor
 
-                    except Exception:
-                        db.rollback()
-                        raise
-
-                    db.refresh(anchor)
-                    return anchor
+            finally:
+                cls._release_spatial_lock(lock_handle)
 
     @classmethod
     def evaluate_complaint(
