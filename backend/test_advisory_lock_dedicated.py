@@ -37,12 +37,9 @@ class TestPostgresAdvisoryLockDedicated(unittest.TestCase):
         mock_session = MagicMock()
         mock_session.get_bind.return_value = mock_engine
 
-        # Acquire lock
-        with GmailSyncLock.acquire(mock_session) as acquired:
+        # Acquire lock using explicit engine
+        with GmailSyncLock.acquire(mock_engine) as acquired:
             self.assertTrue(acquired)
-            # Application session commits during sync
-            mock_session.commit()
-            mock_session.commit()
             # Verify lock connection was checked out and called try_lock + commit
             mock_engine.connect.assert_called_once()
             self.assertEqual(mock_conn.execute.call_count, 1)
@@ -51,6 +48,31 @@ class TestPostgresAdvisoryLockDedicated(unittest.TestCase):
         # After exiting with block: verify unlock was executed, committed, and closed
         self.assertEqual(mock_conn.execute.call_count, 2)
         mock_conn.close.assert_called_once()
+
+    def test_sync_lock_uses_get_lock_engine_when_session_passed(self):
+        """GmailSyncLock.acquire() must use get_lock_engine() for PostgreSQL even when called with an application Session."""
+        mock_session = MagicMock(spec=["get_bind", "commit"])
+        mock_session_engine = MagicMock()
+        mock_session_engine.dialect.name = "postgresql"
+        mock_session.get_bind.return_value = mock_session_engine
+
+        mock_lock_engine = MagicMock()
+        mock_lock_engine.dialect.name = "postgresql"
+        mock_lock_conn = MagicMock()
+        mock_lock_conn.execute.side_effect = [
+            MagicMock(scalar=lambda: True),  # pg_try_advisory_lock
+            MagicMock(scalar=lambda: True),  # pg_advisory_unlock
+        ]
+        mock_lock_engine.connect.return_value = mock_lock_conn
+
+        with patch("app.services.email.inbox_monitor.get_lock_engine", return_value=mock_lock_engine) as mock_get_lock:
+            with GmailSyncLock.acquire(mock_session) as acquired:
+                self.assertTrue(acquired)
+                # Session commit must NOT affect lock engine
+                mock_session.commit()
+                mock_get_lock.assert_called()
+                mock_lock_engine.connect.assert_called_once()
+                mock_session_engine.connect.assert_not_called()
 
     def test_mock_engine_acquisition_failure_closes_connection(self):
         """When pg_try_advisory_lock returns False, dedicated connection is immediately closed and False yielded."""
@@ -61,10 +83,7 @@ class TestPostgresAdvisoryLockDedicated(unittest.TestCase):
 
         mock_conn.execute.return_value = MagicMock(scalar=lambda: False)
 
-        mock_session = MagicMock()
-        mock_session.get_bind.return_value = mock_engine
-
-        with GmailSyncLock.acquire(mock_session) as acquired:
+        with GmailSyncLock.acquire(mock_engine) as acquired:
             self.assertFalse(acquired)
 
         # Dedicated connection closed without executing unlock
@@ -79,10 +98,7 @@ class TestPostgresAdvisoryLockDedicated(unittest.TestCase):
 
         mock_conn.execute.side_effect = Exception("Network timeout during lock acquisition")
 
-        mock_session = MagicMock()
-        mock_session.get_bind.return_value = mock_engine
-
-        with GmailSyncLock.acquire(mock_session) as acquired:
+        with GmailSyncLock.acquire(mock_engine) as acquired:
             self.assertFalse(acquired)
 
         mock_conn.invalidate.assert_called_once()
@@ -100,10 +116,7 @@ class TestPostgresAdvisoryLockDedicated(unittest.TestCase):
             Exception("Connection reset during unlock"),  # unlock raises
         ]
 
-        mock_session = MagicMock()
-        mock_session.get_bind.return_value = mock_engine
-
-        with GmailSyncLock.acquire(mock_session) as acquired:
+        with GmailSyncLock.acquire(mock_engine) as acquired:
             self.assertTrue(acquired)
 
         mock_conn.invalidate.assert_called_once()
@@ -121,10 +134,7 @@ class TestPostgresAdvisoryLockDedicated(unittest.TestCase):
             MagicMock(scalar=lambda: False),  # unlock returned False
         ]
 
-        mock_session = MagicMock()
-        mock_session.get_bind.return_value = mock_engine
-
-        with GmailSyncLock.acquire(mock_session) as acquired:
+        with GmailSyncLock.acquire(mock_engine) as acquired:
             self.assertTrue(acquired)
 
         mock_conn.invalidate.assert_called_once()
@@ -170,12 +180,12 @@ class TestPostgresAdvisoryLockDedicated(unittest.TestCase):
         app_session = PgSession()
 
         try:
-            # Connectivity check: skip test gracefully if remote Neon endpoint is currently unreachable
+            # Connectivity check: skip test gracefully if remote Neon direct lock endpoint is unreachable
             try:
-                with pg_engine.connect() as test_conn:
+                with get_lock_engine().connect() as test_conn:
                     test_conn.execute(text("SELECT 1"))
             except Exception as conn_err:
-                self.skipTest(f"Remote Neon PostgreSQL endpoint is unreachable from this network ({conn_err}); skipping live Neon test.")
+                self.skipTest(f"Remote Neon PostgreSQL direct lock endpoint is unreachable from this network ({conn_err}); skipping live Neon test.")
 
             # Step 1: Acquire lock using GmailSyncLock on app_session
             with GmailSyncLock.acquire(app_session) as acquired:
@@ -374,6 +384,71 @@ class TestEnsureEmailMessageSchemaMigration(unittest.TestCase):
                     os.remove(temp_db_path)
                 except Exception:
                     pass
+
+    def test_schema_migration_postgres_lock_acquisition_failure_aborts_and_invalidates(self):
+        """When acquiring PostgreSQL migration advisory lock fails, migration must abort with RuntimeError and invalidate connection."""
+        mock_engine = MagicMock()
+        mock_engine.dialect.name = "postgresql"
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = Exception("SSL connection lost during pg_advisory_lock")
+        mock_engine.connect.return_value = mock_conn
+
+        with self.assertRaises(RuntimeError) as ctx:
+            ensure_email_message_schema(bind=mock_engine)
+        self.assertIn("unable to acquire migration advisory lock", str(ctx.exception))
+        mock_conn.invalidate.assert_called_once()
+
+    def test_schema_migration_postgres_unlock_failure_invalidates_connection(self):
+        """When unlocking PostgreSQL migration advisory lock fails or returns False, connection must be invalidated."""
+        mock_engine = MagicMock()
+        mock_engine.dialect.name = "postgresql"
+        mock_conn = MagicMock()
+        # 1. pg_advisory_lock succeeds
+        # 2. pg_advisory_unlock raises
+        mock_conn.execute.side_effect = [
+            MagicMock(),  # pg_advisory_lock
+            Exception("Connection reset during unlock"),  # pg_advisory_unlock
+        ]
+        mock_engine.connect.return_value = mock_conn
+
+        mock_inspector = MagicMock()
+        mock_inspector.get_table_names.return_value = ["email_messages"]
+        mock_inspector.get_columns.return_value = [
+            {"name": "id"},
+            {"name": "acknowledgement_retry_count"},
+            {"name": "acknowledgement_last_retry_at"}
+        ]
+
+        with patch("sqlalchemy.inspect", return_value=mock_inspector):
+            ensure_email_message_schema(bind=mock_engine)
+            mock_conn.invalidate.assert_called_once()
+
+    def test_schema_migration_uses_get_lock_engine_on_postgres_by_default(self):
+        """When target_engine is PostgreSQL and bind is None, ensure_email_message_schema uses get_lock_engine()."""
+        mock_lock_engine = MagicMock()
+        mock_lock_engine.dialect.name = "postgresql"
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = [
+            MagicMock(),  # pg_advisory_lock
+            MagicMock(scalar=lambda: True),  # pg_advisory_unlock
+        ]
+        mock_lock_engine.connect.return_value = mock_conn
+
+        mock_inspector = MagicMock()
+        mock_inspector.get_table_names.return_value = ["email_messages"]
+        mock_inspector.get_columns.return_value = [
+            {"name": "id"},
+            {"name": "acknowledgement_retry_count"},
+            {"name": "acknowledgement_last_retry_at"}
+        ]
+
+        with patch("app.database.engine") as mock_default_engine:
+            mock_default_engine.dialect.name = "postgresql"
+            with patch("app.database.get_lock_engine", return_value=mock_lock_engine) as mock_get_lock:
+                with patch("sqlalchemy.inspect", return_value=mock_inspector):
+                    ensure_email_message_schema(bind=None)
+                    mock_get_lock.assert_called_once()
+                    mock_lock_engine.connect.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

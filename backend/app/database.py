@@ -117,7 +117,9 @@ def ensure_email_message_schema(bind=None):
     Concurrency-safe, non-destructive schema verification and migration for email_messages table.
     Ensures persistent retry tracking columns exist without altering or deleting existing records.
     Safe for simultaneous multi-instance cold starts (e.g. Vercel serverless containers):
-    - Uses PostgreSQL advisory lock + ADD COLUMN IF NOT EXISTS on PostgreSQL.
+    - Uses verified direct lock connection from get_lock_engine() on PostgreSQL.
+    - Aborts migration if advisory lock acquisition fails, invalidating the connection.
+    - Invalidates connection on unlock failure to prevent leaking locked sessions back to pool.
     - Uses process locking and idempotent duplicate-column handling on SQLite.
     - Fails loudly with RuntimeError if schema cannot be verified or migrated.
     """
@@ -126,17 +128,27 @@ def ensure_email_message_schema(bind=None):
     is_pg = target_engine.dialect.name == "postgresql"
 
     with _schema_migration_lock:
-        conn = target_engine.connect()
+        # On PostgreSQL, use verified direct unpooled lock engine from get_lock_engine()
+        # unless an explicit test bind was provided
+        migration_engine = get_lock_engine() if (is_pg and bind is None) else target_engine
+        conn = migration_engine.connect()
+        lock_acquired = False
         try:
-            # On PostgreSQL, acquire dedicated transaction/session advisory lock during migration
+            # On PostgreSQL, acquire dedicated session advisory lock during migration
             if is_pg:
                 try:
                     conn.execute(text(f"SELECT pg_advisory_lock({MIGRATION_ADVISORY_LOCK_ID})"))
                     conn.commit()
+                    lock_acquired = True
                 except Exception as lock_err:
-                    logger.warning(f"Could not acquire migration advisory lock on PostgreSQL: {lock_err}")
+                    logger.error(f"Failed to acquire migration advisory lock on PostgreSQL: {lock_err}")
+                    try:
+                        conn.invalidate()
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"Database migration failure: unable to acquire migration advisory lock: {lock_err}") from lock_err
 
-            inspector = inspect(target_engine)
+            inspector = inspect(migration_engine)
             if "email_messages" in inspector.get_table_names():
                 columns = {c["name"] for c in inspector.get_columns("email_messages")}
 
@@ -178,7 +190,7 @@ def ensure_email_message_schema(bind=None):
                             raise
 
                 # Post-migration verification: confirm required columns are now active
-                updated_inspector = inspect(target_engine)
+                updated_inspector = inspect(migration_engine)
                 columns_after = {c["name"] for c in updated_inspector.get_columns("email_messages")}
                 missing = {"acknowledgement_retry_count", "acknowledgement_last_retry_at"} - columns_after
                 if missing:
@@ -187,10 +199,24 @@ def ensure_email_message_schema(bind=None):
             logger.error(f"Critical database migration failure in ensure_email_message_schema: {e}")
             raise RuntimeError(f"Database migration failure: unable to verify or create email_messages schema: {e}") from e
         finally:
-            if is_pg:
+            if is_pg and lock_acquired:
                 try:
-                    conn.execute(text(f"SELECT pg_advisory_unlock({MIGRATION_ADVISORY_LOCK_ID})"))
-                    conn.commit()
-                except Exception:
-                    pass
-            conn.close()
+                    res = conn.execute(text(f"SELECT pg_advisory_unlock({MIGRATION_ADVISORY_LOCK_ID})")).scalar()
+                    if not res:
+                        logger.error(f"pg_advisory_unlock({MIGRATION_ADVISORY_LOCK_ID}) returned False")
+                        try:
+                            conn.invalidate()
+                        except Exception:
+                            pass
+                    else:
+                        conn.commit()
+                except Exception as unlock_err:
+                    logger.error(f"Exception during pg_advisory_unlock in ensure_email_message_schema: {unlock_err}")
+                    try:
+                        conn.invalidate()
+                    except Exception:
+                        pass
+            try:
+                conn.close()
+            except Exception:
+                pass

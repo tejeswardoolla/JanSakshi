@@ -41,29 +41,48 @@ class GmailSyncLock:
     @contextmanager
     def acquire(cls, db_or_engine=None):
         target_engine = None
+        is_session = False
+
         if db_or_engine:
-            if hasattr(db_or_engine, "get_bind"):
+            if hasattr(db_or_engine, "get_bind") and not hasattr(db_or_engine, "dialect"):
+                is_session = True
                 try:
                     target_engine = db_or_engine.get_bind()
                 except Exception:
                     target_engine = getattr(db_or_engine, "bind", None)
+            elif hasattr(db_or_engine, "dialect"):
+                target_engine = db_or_engine
             elif hasattr(db_or_engine, "connect"):
                 target_engine = db_or_engine
 
-        if not target_engine:
-            target_engine = get_lock_engine()
-
+        # Determine whether running on PostgreSQL
         is_postgres = False
         try:
-            if target_engine and target_engine.dialect.name == "postgresql":
-                is_postgres = True
+            if target_engine and getattr(target_engine, "dialect", None):
+                if target_engine.dialect.name == "postgresql":
+                    is_postgres = True
+            else:
+                default_lock_eng = get_lock_engine()
+                if default_lock_eng and getattr(default_lock_eng, "dialect", None) and default_lock_eng.dialect.name == "postgresql":
+                    is_postgres = True
         except Exception:
             pass
 
         if is_postgres:
+            # On PostgreSQL, ALWAYS use get_lock_engine() to obtain a dedicated unpooled connection,
+            # even when sync_inbox receives a SQLAlchemy Session, to prevent locks running
+            # through the application's pooled (-pooler) connection.
+            # (If an explicit mock/test Engine was passed directly, not a Session, respect that engine).
+            if is_session or db_or_engine is None:
+                lock_engine = get_lock_engine()
+            elif hasattr(db_or_engine, "connect") and getattr(db_or_engine, "dialect", None) and db_or_engine.dialect.name == "postgresql":
+                lock_engine = db_or_engine
+            else:
+                lock_engine = target_engine or get_lock_engine()
+
             conn = None
             try:
-                conn = target_engine.connect()
+                conn = lock_engine.connect()
             except Exception as e:
                 logger.error(f"Failed to check out dedicated connection for advisory lock: {e}")
                 yield False
