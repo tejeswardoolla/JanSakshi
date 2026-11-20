@@ -1921,17 +1921,29 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
     def test_45_concurrent_same_location_requests_cannot_create_duplicate_anchors_after_collision_rollback(self):
         """45. Concurrent same-location requests resolve to exactly one canonical anchor; no duplicates created."""
         from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
-        from app.models.complaint import PhysicalIssue
+        from app.models.complaint import PhysicalIssue, Complaint
 
         c1 = self._create_test_complaint("cit-conc-1", "Water Supply", 16.5500, 80.5500, "Burst pipe report 1")
         c2 = self._create_test_complaint("cit-conc-2", "Water Supply", 16.5500, 80.5500, "Burst pipe report 2")
 
-        # Run concurrent anchor creation via thread pool
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            fut1 = executor.submit(DuplicateDetector._create_provisional_anchor, c1, self.db)
-            fut2 = executor.submit(DuplicateDetector._create_provisional_anchor, c2, self.db)
-            anchor1 = fut1.result()
-            anchor2 = fut2.result()
+        # Use independent SQLAlchemy sessions for concurrent workers rather than sharing a single session
+        session_factory = sessionmaker(bind=self.db.get_bind())
+        db1 = session_factory()
+        db2 = session_factory()
+
+        try:
+            comp1 = db1.query(Complaint).filter_by(complaint_id=c1.complaint_id).first()
+            comp2 = db2.query(Complaint).filter_by(complaint_id=c2.complaint_id).first()
+
+            # Run concurrent anchor creation via thread pool with independent sessions
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                fut1 = executor.submit(DuplicateDetector._create_provisional_anchor, comp1, db1)
+                fut2 = executor.submit(DuplicateDetector._create_provisional_anchor, comp2, db2)
+                anchor1 = fut1.result()
+                anchor2 = fut2.result()
+        finally:
+            db1.close()
+            db2.close()
 
         # Both complaints must receive the EXACT same canonical anchor
         self.assertEqual(anchor1.issue_reference_id, anchor2.issue_reference_id)
@@ -1991,6 +2003,194 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
             PhysicalIssue.representative_latitude <= 16.10006 + 0.0001,
         ).all()
         self.assertEqual(len(anchors), 1, "Exactly one canonical anchor must be created despite split decimal rounding")
+
+    def test_47_real_postgresql_concurrent_boundary_anchor_creation(self):
+        """47. Genuine PostgreSQL integration test for boundary coordinates concurrency using isolated test database."""
+        test_url = os.getenv("TEST_DATABASE_URL", "").strip() or os.getenv("POSTGRES_TEST_DATABASE_URL", "").strip()
+        if not test_url or not test_url.startswith("postgres"):
+            self.skipTest("Isolated PostgreSQL test database (TEST_DATABASE_URL) is not configured; skipping live PostgreSQL concurrency integration test.")
+
+        # Never connect to production database
+        if "production" in test_url.lower() or "prod" in test_url.lower():
+            self.skipTest("TEST_DATABASE_URL appears to reference a production database; skipping live test for safety.")
+
+        from app.database import Base
+        from app.models.complaint import Complaint, PhysicalIssue, DuplicateMatch
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.routes.duplicates import approve_match
+
+        test_pg_engine = create_engine(test_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+        try:
+            with test_pg_engine.connect() as probe:
+                probe.execute(text("SELECT 1"))
+        except Exception as conn_err:
+            self.skipTest(f"Configured PostgreSQL test database unreachable: {conn_err}; skipping live integration test.")
+
+        # Ensure schema on test database
+        Base.metadata.create_all(bind=test_pg_engine)
+        PgSessionFactory = sessionmaker(bind=test_pg_engine)
+
+        session_cleanup = PgSessionFactory()
+        try:
+            # Clean test records for boundary coords
+            session_cleanup.query(DuplicateMatch).delete()
+            session_cleanup.query(Complaint).filter(Complaint.category == "Roads Boundary Test").delete()
+            session_cleanup.query(PhysicalIssue).filter(PhysicalIssue.category == "Roads Boundary Test").delete()
+            session_cleanup.commit()
+        finally:
+            session_cleanup.close()
+
+        # Seed initial complaints across two independent sessions
+        sess_init1 = PgSessionFactory()
+        sess_init2 = PgSessionFactory()
+        try:
+            now_val = utc_now()
+            c1 = Complaint(
+                complaint_id="JS-2026-PG-TEST-01",
+                citizen_id="cit-pg-01",
+                category="Roads Boundary Test",
+                latitude=16.10004,
+                longitude=80.10004,
+                description="Pothole at boundary 16.10004",
+                address="Road Boundary A",
+                current_status="Submitted",
+                created_at=now_val,
+                updated_at=now_val,
+            )
+            c2 = Complaint(
+                complaint_id="JS-2026-PG-TEST-02",
+                citizen_id="cit-pg-02",
+                category="Roads Boundary Test",
+                latitude=16.10006,
+                longitude=80.10006,
+                description="Pothole at boundary 16.10006",
+                address="Road Boundary B",
+                current_status="Submitted",
+                created_at=now_val + datetime.timedelta(seconds=1),
+                updated_at=now_val + datetime.timedelta(seconds=1),
+            )
+            sess_init1.add(c1)
+            sess_init1.commit()
+            sess_init2.add(c2)
+            sess_init2.commit()
+        finally:
+            sess_init1.close()
+            sess_init2.close()
+
+        # Run concurrent anchor creation / evaluation using 2 separate sessions on genuine PostgreSQL
+        def worker_evaluate(comp_id: str):
+            w_session = PgSessionFactory()
+            try:
+                matches = DuplicateDetector.evaluate_complaint(comp_id, w_session, search_radius_meters=150.0)
+                return [m.id for m in matches]
+            finally:
+                w_session.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            fut1 = executor.submit(worker_evaluate, "JS-2026-PG-TEST-01")
+            fut2 = executor.submit(worker_evaluate, "JS-2026-PG-TEST-02")
+            m_ids1 = fut1.result()
+            m_ids2 = fut2.result()
+
+        # Verify results on independent verification session
+        verify_sess = PgSessionFactory()
+        try:
+            anchors = verify_sess.query(PhysicalIssue).filter(PhysicalIssue.category == "Roads Boundary Test").all()
+            self.assertEqual(len(anchors), 1, "Exactly one canonical PhysicalIssue anchor must exist on PostgreSQL")
+            canonical_ref = anchors[0].issue_reference_id
+
+            comp_db1 = verify_sess.query(Complaint).filter_by(complaint_id="JS-2026-PG-TEST-01").first()
+            comp_db2 = verify_sess.query(Complaint).filter_by(complaint_id="JS-2026-PG-TEST-02").first()
+
+            # Confirm complaint independence: first is anchored, second remains unlinked pending human review
+            self.assertEqual(comp_db1.issue_id, canonical_ref)
+            self.assertIsNone(comp_db2.issue_id, "Subsequent complaint must NOT be silently auto-linked")
+
+            # Subsequent complaint must have a pending DuplicateMatch
+            pending_match = verify_sess.query(DuplicateMatch).filter_by(
+                complaint_id="JS-2026-PG-TEST-02",
+                physical_issue_id=canonical_ref
+            ).first()
+            self.assertIsNotNone(pending_match, "Pending DuplicateMatch must be recorded for human review")
+            self.assertEqual(pending_match.review_status, "pending")
+
+            # Verify that ONLY authority approval associates the complaint
+            app_result = approve_match(
+                match_id=pending_match.id,
+                reviewer_id="Officer Postgres",
+                review_reason="Verified duplicate on live PG",
+                db=verify_sess
+            )
+            self.assertEqual(app_result["status"], "success")
+
+            verify_sess.refresh(comp_db2)
+            self.assertEqual(comp_db2.issue_id, canonical_ref, "Complaint must only be associated after authority approval")
+        finally:
+            verify_sess.close()
+
+    def test_48_advisory_lock_released_immediately_on_existing_anchor_return(self):
+        """48. When an existing anchor is found, read transaction is committed to release pg_advisory_xact_lock immediately."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue
+
+        # Pre-seed an existing PhysicalIssue anchor
+        anchor_id = "ISSUE-2026-LOCK-REL-01"
+        existing = PhysicalIssue(
+            issue_reference_id=anchor_id,
+            category="Streetlights",
+            representative_latitude=16.3000,
+            representative_longitude=80.3000,
+            representative_location="16.3000, 80.3000",
+            description="Existing streetlight cluster",
+            current_status="Open",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        self.db.add(existing)
+        self.db.commit()
+
+        # Create new complaint at the exact same location
+        c_new = self._create_test_complaint(
+            citizen_id="cit-lock-rel",
+            category="Streetlights",
+            lat=16.3000,
+            lon=80.3000,
+            desc="Another dark lamp near the cluster"
+        )
+
+        commit_count = 0
+        real_commit = self.db.commit
+        real_execute = self.db.execute
+
+        def spy_commit():
+            nonlocal commit_count
+            commit_count += 1
+            real_commit()
+
+        def spy_execute(statement, *args, **kwargs):
+            stmt_str = str(statement)
+            if "pg_advisory_xact_lock" in stmt_str:
+                return MagicMock()
+            return real_execute(statement, *args, **kwargs)
+
+        with patch("app.services.issue_id_service.get_verified_database_dialect", return_value="postgresql"):
+            with patch.object(self.db, "execute", side_effect=spy_execute):
+                with patch.object(self.db, "commit", side_effect=spy_commit):
+                    # Call _create_provisional_anchor
+                    returned_anchor = DuplicateDetector._create_provisional_anchor(c_new, self.db)
+
+        # Confirm returned anchor is the pre-existing anchor
+        self.assertEqual(returned_anchor.issue_reference_id, anchor_id)
+        # Confirm complaint was NOT auto-linked
+        self.assertIsNone(c_new.issue_id)
+
+        # Crucial check: db.commit() MUST have been called by _release_read_lock_if_clean()
+        # to terminate the read transaction and release pg_advisory_xact_lock in PostgreSQL!
+        self.assertGreaterEqual(
+            commit_count,
+            1,
+            "Expected db.commit() to be called on clean read transaction to release pg_advisory_xact_lock before returning"
+        )
 
 
 if __name__ == "__main__":

@@ -88,6 +88,17 @@ class DuplicateDetector:
                         raise
                 return None
 
+            def _release_read_lock_if_clean() -> None:
+                """
+                In PostgreSQL, pg_advisory_xact_lock is bound to the transaction lifecycle.
+                When returning an existing anchor without mutating data, end the read transaction
+                so the advisory mutex is immediately released prior to downstream candidate
+                evaluation (expensive text/image similarity scoring).
+                Only commits if there is no pending uncommitted caller state (not db.dirty, db.new, db.deleted).
+                """
+                if dialect_name == "postgresql" and not (db.dirty or db.new or db.deleted):
+                    db.commit()
+
             # Acquire spatial lock before checking existing anchor or allocating a new anchor
             _acquire_spatial_lock()
 
@@ -97,6 +108,7 @@ class DuplicateDetector:
                 # Do NOT automatically associate the complaint.
                 # Preserve complaint independence; return the existing anchor to be evaluated
                 # as a duplicate candidate for authority review.
+                _release_read_lock_if_clean()
                 return existing_exact
 
             rep_location = (
@@ -159,6 +171,7 @@ class DuplicateDetector:
                             if existing_exact:
                                 # Return the existing anchor without automatically linking the complaint;
                                 # it will be processed through the human review duplicate match workflow.
+                                _release_read_lock_if_clean()
                                 return existing_exact
 
                             continue
