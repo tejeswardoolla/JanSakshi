@@ -184,25 +184,92 @@ class AcknowledgementService:
         db: Session,
         complaint: Complaint,
         email_record: EmailMessage,
-        location_missing: bool = False
+        location_missing: bool = False,
+        force_retry: bool = False
     ) -> bool:
         """
         Sends rich HTML + plain text acknowledgement email to citizen and updates database records.
+        Returns True if acknowledgement was successfully sent (or already sent), False if sending failed.
+        Includes timeout recovery check against Gmail thread to prevent duplicate sends.
         """
         if email_record.acknowledgement_sent:
             logger.info(f"Acknowledgement already sent for message {email_record.gmail_message_id}; skipping.")
             return True
 
-        subject, body_text, body_html = cls.generate_email_content(
-            complaint=complaint,
-            email_record=email_record,
-            location_missing=location_missing
-        )
-
-        # Attempt to send via Gmail API
-        sent_id = None
+        # Attempt to get Gmail API service
         service = GmailAuthService.get_gmail_service()
-        if service:
+        if not service:
+            err_msg = "Gmail service unavailable: mailbox is disconnected or unauthorized"
+            logger.warning(f"{err_msg}. Acknowledgement email not dispatched for {complaint.complaint_id}.")
+            email_record.acknowledgement_sent = False
+            email_record.acknowledgement_sent_at = None
+            email_record.acknowledgement_message_id = None
+            email_record.error_details = err_msg
+            email_record.acknowledgement_retry_count = (getattr(email_record, "acknowledgement_retry_count", 0) or 0) + (0 if force_retry else 1)
+            email_record.acknowledgement_last_retry_at = utc_now()
+            db.commit()
+            return False
+
+        # ------------------------------------------------------------------
+        # Ambiguous Timeout Recovery: Check if already delivered in thread
+        # ------------------------------------------------------------------
+        sent_id = None
+        if email_record.gmail_thread_id:
+            try:
+                profile = GmailAuthService.get_mailbox_profile() or {}
+                official_email = (profile.get("email_address") or GMAIL_INBOX_ADDRESS or "").strip().lower()
+                citizen_email = (email_record.sender_email or "").strip().lower()
+
+                thread_data = service.users().threads().get(
+                    userId="me",
+                    id=email_record.gmail_thread_id,
+                    format="metadata",
+                    metadataHeaders=["Subject", "To", "From"]
+                ).execute()
+                for tmsg in thread_data.get("messages", []):
+                    # 1. Must not be the original incoming message
+                    if tmsg.get("id") == email_record.gmail_message_id:
+                        continue
+
+                    # 2. Must genuinely be an outgoing sent message (SENT label in Gmail)
+                    labels = tmsg.get("labelIds", [])
+                    if "SENT" not in labels:
+                        continue
+
+                    t_headers = {h["name"].lower(): h["value"] for h in tmsg.get("payload", {}).get("headers", [])}
+                    t_subj = t_headers.get("subject", "")
+                    t_to = t_headers.get("to", "").lower()
+                    t_from = t_headers.get("from", "").lower()
+
+                    # 3. Subject must reference the complaint ID
+                    if complaint.complaint_id not in t_subj:
+                        continue
+
+                    # 4. Recipient (To) must match the citizen sender email
+                    if citizen_email and (citizen_email not in t_to):
+                        continue
+
+                    # 5. Sender (From) must not be the citizen
+                    if citizen_email and (citizen_email in t_from and not (official_email and official_email in t_from)):
+                        continue
+
+                    sent_id = tmsg.get("id")
+                    logger.info(
+                        f"Discovered verified previously delivered acknowledgement in thread "
+                        f"{email_record.gmail_thread_id} (ambiguous timeout recovery): {sent_id}"
+                    )
+                    break
+            except Exception as thread_err:
+                logger.debug(f"Thread deduplication check skipped: {thread_err}")
+
+        # If not already present in thread, send via Gmail API
+        if not sent_id:
+            subject, body_text, body_html = cls.generate_email_content(
+                complaint=complaint,
+                email_record=email_record,
+                location_missing=location_missing
+            )
+
             try:
                 profile = GmailAuthService.get_mailbox_profile() or {}
                 my_email = profile.get("email_address") or GMAIL_INBOX_ADDRESS or "me"
@@ -216,22 +283,44 @@ class AcknowledgementService:
                     in_reply_to=email_record.gmail_message_id
                 )
                 sent = service.users().messages().send(userId="me", body=msg_payload).execute()
-                sent_id = sent.get("id")
+                sent_id = sent.get("id") if isinstance(sent, dict) else None
+
+                if not sent_id:
+                    err_msg = "Gmail API send returned no message ID"
+                    logger.error(f"{err_msg} for {complaint.complaint_id}")
+                    email_record.acknowledgement_sent = False
+                    email_record.acknowledgement_sent_at = None
+                    email_record.acknowledgement_message_id = None
+                    email_record.error_details = err_msg
+                    email_record.acknowledgement_retry_count = (getattr(email_record, "acknowledgement_retry_count", 0) or 0) + 1
+                    email_record.acknowledgement_last_retry_at = utc_now()
+                    db.commit()
+                    return False
+
                 logger.info(f"Sent acknowledgement email for {complaint.complaint_id} -> {email_record.sender_email} (Msg ID: {sent_id})")
             except Exception as e:
-                logger.error(f"Failed to send email via Gmail API: {e}")
-                # Record the error on email message but proceed with audit
-                email_record.error_details = f"Email send failed: {str(e)}"
-        else:
-            logger.info(f"Gmail service not connected. Acknowledgement generated and recorded in system for {complaint.complaint_id}")
-            sent_id = f"simulated_ack_{complaint.complaint_id}"
+                err_msg = f"Email send failed: {str(e)}"
+                logger.error(f"Failed to send email via Gmail API for {complaint.complaint_id}: {e}")
+                email_record.acknowledgement_sent = False
+                email_record.acknowledgement_sent_at = None
+                email_record.acknowledgement_message_id = None
+                email_record.error_details = err_msg
+                email_record.acknowledgement_retry_count = (getattr(email_record, "acknowledgement_retry_count", 0) or 0) + 1
+                email_record.acknowledgement_last_retry_at = utc_now()
+                db.commit()
+                return False
 
-        # Update email record
+        # Update email record upon verified delivery
         email_record.acknowledgement_sent = True
         email_record.acknowledgement_sent_at = utc_now()
         email_record.acknowledgement_message_id = sent_id
+        email_record.acknowledgement_last_retry_at = utc_now()
+        if force_retry:
+            email_record.acknowledgement_retry_count = 0
+        if email_record.error_details and ("send" in email_record.error_details.lower() or "gmail" in email_record.error_details.lower() or "retries exhausted" in email_record.error_details.lower()):
+            email_record.error_details = None
 
-        # Audit event on complaint
+        # Audit event on complaint - strictly created only upon verified successful send
         loc_is_missing = location_missing or complaint.latitude is None or complaint.longitude is None
         event = ComplaintEvent(
             complaint_id=complaint.complaint_id,

@@ -369,6 +369,16 @@ Categories of Civic Complaints:
 - Damaged Public Infrastructure
 - Other (Public municipal issues only)
 
+Categories of Ambiguous / Administrative Inquiries (Requires Human Admin Review):
+- Citizen administrative questions, visiting timings, property tax office hours, procedure inquiries
+- Certificate issuance questions (birth/death, trade license), RTI inquiries
+- General citizen communications directed to the municipality that are not clear physical hazard complaints but need staff review
+
+Classification Definitions:
+- "CIVIC_COMPLAINT": Genuine municipal infrastructure problem reported by citizen.
+- "NON_CIVIC": Automated transactional notification, OTP, receipt, marketing, bounce, or commercial spam.
+- "AMBIGUOUS": Citizen inquiry, municipal office timing, administrative question, or borderline query requiring municipal admin review.
+
 Respond with a single JSON object with these exact keys:
 {
   "is_civic": boolean,
@@ -389,7 +399,7 @@ Subject: {subject}
 {body[:3000]}
 <<<END_EMAIL_BODY_UNTRUSTED>>>
 
-Analyze whether this message represents a genuine civic complaint. Output valid JSON only.
+Analyze whether this message represents a genuine civic complaint, non-civic message, or ambiguous municipal inquiry. Output valid JSON only.
 """
 
         def _call_gemini():
@@ -424,12 +434,15 @@ Analyze whether this message represents a genuine civic complaint. Output valid 
             category = str(data.get("category", "Other"))
             reasoning = str(data.get("reasoning", "Classified by Gemini AI"))
 
-            if not is_civic or classification_str == "NON_CIVIC":
-                decision = DecisionType.NON_CIVIC
-                suggested_action = "ignore"
-            elif is_civic and classification_str == "CIVIC_COMPLAINT" and confidence >= 0.7:
+            if classification_str == "AMBIGUOUS":
+                decision = DecisionType.NEEDS_ADMIN_REVIEW
+                suggested_action = "admin_review"
+            elif classification_str == "CIVIC_COMPLAINT" and is_civic and confidence >= 0.7:
                 decision = DecisionType.CIVIC_COMPLAINT
                 suggested_action = "create_complaint"
+            elif classification_str == "NON_CIVIC" or not is_civic:
+                decision = DecisionType.NON_CIVIC
+                suggested_action = "ignore"
             else:
                 decision = DecisionType.NEEDS_ADMIN_REVIEW
                 suggested_action = "admin_review"

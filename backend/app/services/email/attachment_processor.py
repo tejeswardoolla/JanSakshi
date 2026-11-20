@@ -4,6 +4,9 @@ import re
 import logging
 from typing import List, Dict, Any, Optional
 
+from app.core.config import APP_ENV
+from app.services.storage_service import is_blob_storage_enabled, save_evidence_bytes
+
 logger = logging.getLogger("jansakshi.email.attachments")
 
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -76,7 +79,45 @@ class AttachmentProcessor:
 
         detected_mime = mime_type or ("video/mp4" if is_video else "image/jpeg")
 
-        # Save file to storage/evidence
+        # -------------------------------------------------------------
+        # Storage Backend Selection with Production Fail-Closed Safety
+        # -------------------------------------------------------------
+        is_prod = (APP_ENV == "production") or bool(os.getenv("VERCEL"))
+
+        if is_prod:
+            if not is_blob_storage_enabled():
+                logger.error(
+                    f"Production attachment processing failed for '{clean_name}': "
+                    "BLOB_READ_WRITE_TOKEN is not configured. Ephemeral local disk fallback is blocked in production."
+                )
+                return None
+
+            try:
+                blob_meta = save_evidence_bytes(
+                    content=content_bytes,
+                    filename=clean_name,
+                    content_type=detected_mime
+                )
+                logger.info(f"Saved email attachment to Vercel Blob: {clean_name} -> {blob_meta.get('storage_path')}")
+                return blob_meta
+            except Exception as e:
+                logger.error(f"Production Vercel Blob upload failed for '{clean_name}': {e}. Fail-closed: refusing local fallback.")
+                return None
+
+        # Development / Testing Mode
+        if is_blob_storage_enabled():
+            try:
+                blob_meta = save_evidence_bytes(
+                    content=content_bytes,
+                    filename=clean_name,
+                    content_type=detected_mime
+                )
+                logger.info(f"Saved email attachment to Vercel Blob (dev): {clean_name} -> {blob_meta.get('storage_path')}")
+                return blob_meta
+            except Exception as e:
+                logger.warning(f"Vercel Blob upload failed in development for '{clean_name}': {e}. Falling back to local storage.")
+
+        # Fallback to local filesystem storage (development & testing only)
         os.makedirs(target_dir, exist_ok=True)
         stored_filename = f"{uuid.uuid4().hex}{ext}"
         storage_path = os.path.abspath(os.path.join(target_dir, stored_filename))

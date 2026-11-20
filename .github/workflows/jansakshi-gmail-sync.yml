@@ -1,0 +1,61 @@
+name: JanSakshi Gmail Civic Complaint Synchronization
+
+on:
+  schedule:
+    # Run every 5 minutes (external scheduler triggering Vercel production endpoint)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    # Allows manual trigger from GitHub Actions tab
+
+# Prevent concurrent runs from piling up
+concurrency:
+  group: jansakshi-gmail-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-inbox:
+    name: Trigger Gmail Sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Trigger JanSakshi Production Inbox Sync
+        env:
+          CRON_SECRET: ${{ secrets.JANSAKSHI_CRON_SECRET }}
+          ENDPOINT_URL: https://jansakshi-umber.vercel.app/api/email/cron-sync
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::JANSAKSHI_CRON_SECRET secret is not configured in repository settings."
+            exit 1
+          fi
+
+          echo "Initiating scheduled inbox synchronization..."
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$ENDPOINT_URL" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -H "Accept: application/json" \
+            --max-time 60)
+
+          HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+          HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n 1)
+
+          echo "Response HTTP Status: $HTTP_STATUS"
+
+          # Parse JSON payload status safely
+          STATUS=$(echo "$HTTP_BODY" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+          echo "Synchronization Status: $STATUS"
+
+          if [ "$HTTP_STATUS" -eq 200 ] && [ "$STATUS" = "success" ]; then
+            echo "Synchronization completed successfully."
+            echo "$HTTP_BODY" | jq -r '{status: .status, processed: .processed, ignored: .ignored, skipped: .skipped_previously_processed, total: .total_found, acks_retried: .acknowledgements_retried, acks_success: .acknowledgements_retry_success} | to_entries | map("\(.key): \(.value)") | .[]' 2>/dev/null || echo "Response: $HTTP_BODY"
+          elif [ "$HTTP_STATUS" -eq 200 ] && [ "$STATUS" = "skipped" ]; then
+            echo "::notice::Synchronization skipped: another job or lock is actively running."
+          elif [ "$HTTP_STATUS" -eq 200 ] && [ "$STATUS" = "disabled" ]; then
+            echo "::notice::Synchronization skipped: GMAIL_ENABLED is false."
+          elif [ "$STATUS" = "error" ] || [ "$HTTP_STATUS" -ge 400 ]; then
+            ERROR_MSG=$(echo "$HTTP_BODY" | jq -r '.error // .detail // "Unknown error"' 2>/dev/null || echo "$HTTP_BODY")
+            echo "::error::Synchronization failed (HTTP $HTTP_STATUS, status=$STATUS): $ERROR_MSG"
+            exit 1
+          else
+            echo "::error::Unexpected response (HTTP $HTTP_STATUS): $HTTP_BODY"
+            exit 1
+          fi

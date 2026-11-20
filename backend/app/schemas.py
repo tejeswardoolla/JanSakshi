@@ -223,10 +223,12 @@ class EmailMessageResponse(BaseModel):
     attachments_info: Optional[str] = None
     acknowledgement_sent: Optional[bool] = False
     acknowledgement_sent_at: Optional[datetime.datetime] = None
+    acknowledgement_retry_count: Optional[int] = 0
+    acknowledgement_last_retry_at: Optional[datetime.datetime] = None
     is_follow_up: Optional[bool] = False
     created_at: datetime.datetime
 
-    @field_serializer("received_at", "created_at", "acknowledgement_sent_at")
+    @field_serializer("received_at", "created_at", "acknowledgement_sent_at", "acknowledgement_last_retry_at")
     def serialize_dates(self, dt: Optional[datetime.datetime], _info):
         return serialize_to_utc_iso(dt)
 

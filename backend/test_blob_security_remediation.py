@@ -46,6 +46,8 @@ class TestBlobSecurityRemediation(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.db = SessionLocal()
+        cls.initial_complaint_count = cls.db.query(Complaint).count()
+        cls.initial_evidence_count = cls.db.query(Evidence).count()
 
         # Load test complaints and users
         cls.test_complaint = cls.db.query(Complaint).filter(Complaint.complaint_id == "JS-2026-00057").first()
@@ -283,13 +285,22 @@ class TestBlobSecurityRemediation(unittest.TestCase):
                 self.assertFalse(prep["direct_blob_enabled"], "direct_blob_enabled must be False in local dev")
                 self.assertEqual(prep["standard_upload_endpoint"], "/api/complaints/")
 
-        # Verify all existing 22 complaints intact
+        # Verify strict zero-leakage regression check: complaint count strictly unchanged
         complaint_count = self.db.query(Complaint).count()
-        self.assertEqual(complaint_count, 22, f"Expected 22 complaints, found {complaint_count}")
+        self.assertEqual(
+            complaint_count,
+            self.initial_complaint_count,
+            f"Regression failure: complaint count changed during test execution (expected {self.initial_complaint_count}, found {complaint_count})"
+        )
 
-        # Verify all existing 15 evidence records intact
+        # Verify all existing 15 evidence records intact and strictly unchanged
         evidence_count = self.db.query(Evidence).count()
-        self.assertEqual(evidence_count, 15, f"Expected 15 evidence records, found {evidence_count}")
+        self.assertEqual(evidence_count, 15, f"Expected exactly 15 evidence records, found {evidence_count}")
+        self.assertEqual(
+            evidence_count,
+            self.initial_evidence_count,
+            f"Regression failure: evidence count changed during test execution (expected {self.initial_evidence_count}, found {evidence_count})"
+        )
 
 if __name__ == "__main__":
     unittest.main()
