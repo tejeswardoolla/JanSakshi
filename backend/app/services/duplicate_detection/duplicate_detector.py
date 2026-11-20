@@ -59,45 +59,52 @@ class DuplicateDetector:
 
             dialect_name = get_verified_database_dialect(db)
 
-            if dialect_name == "postgresql" and complaint.latitude is not None and complaint.longitude is not None:
-                lock_key = f"jansakshi_anchor_{complaint.category}_{complaint.latitude:.4f}_{complaint.longitude:.4f}"
-                try:
-                    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": lock_key})
-                except Exception as lock_err:
-                    logger.error(
-                        f"PostgreSQL advisory lock acquisition failed for anchor creation on {complaint.complaint_id}: {lock_err}"
-                    )
-                    db.rollback()
-                    raise RuntimeError(
-                        f"PostgreSQL advisory lock acquisition failed for provisional anchor creation ({complaint.complaint_id}): {lock_err}"
-                    ) from lock_err
+            def _acquire_spatial_lock() -> None:
+                if dialect_name == "postgresql":
+                    lock_key = "jansakshi_provisional_anchor_mutex"
+                    try:
+                        db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": lock_key})
+                    except Exception as lock_err:
+                        logger.error(
+                            f"PostgreSQL advisory lock acquisition failed for anchor creation on {complaint_id}: {lock_err}"
+                        )
+                        db.rollback()
+                        raise RuntimeError(
+                            f"PostgreSQL advisory lock acquisition failed for provisional anchor creation ({complaint_id}): {lock_err}"
+                        ) from lock_err
+
+            def _find_existing_exact_anchor() -> Optional[PhysicalIssue]:
+                if target_lat is not None and target_lon is not None:
+                    try:
+                        return db.query(PhysicalIssue).filter(
+                            PhysicalIssue.category == target_category,
+                            PhysicalIssue.representative_latitude >= target_lat - lat_tol,
+                            PhysicalIssue.representative_latitude <= target_lat + lat_tol,
+                            PhysicalIssue.representative_longitude >= target_lon - lon_tol,
+                            PhysicalIssue.representative_longitude <= target_lon + lon_tol,
+                        ).first()
+                    except Exception:
+                        db.rollback()
+                        raise
+                return None
+
+            # Acquire spatial lock before checking existing anchor or allocating a new anchor
+            _acquire_spatial_lock()
 
             # Check if an anchor already exists at the coordinates and category
-            if complaint.latitude is not None and complaint.longitude is not None:
-                try:
-                    existing_exact = db.query(PhysicalIssue).filter(
-                        PhysicalIssue.category == complaint.category,
-                        PhysicalIssue.representative_latitude >= complaint.latitude - lat_tol,
-                        PhysicalIssue.representative_latitude <= complaint.latitude + lat_tol,
-                        PhysicalIssue.representative_longitude >= complaint.longitude - lon_tol,
-                        PhysicalIssue.representative_longitude <= complaint.longitude + lon_tol,
-                    ).first()
-                    if existing_exact:
-                        target_complaint = db.query(Complaint).filter(Complaint.complaint_id == complaint_id).first() or complaint
-                        target_complaint.issue_id = existing_exact.issue_reference_id
-                        target_complaint.updated_at = utc_now()
-                        db.commit()
-                        return existing_exact
-                except Exception:
-                    db.rollback()
-                    raise
+            existing_exact = _find_existing_exact_anchor()
+            if existing_exact:
+                # Do NOT automatically associate the complaint.
+                # Preserve complaint independence; return the existing anchor to be evaluated
+                # as a duplicate candidate for authority review.
+                return existing_exact
 
             rep_location = (
                 complaint.google_maps_url
                 if complaint.google_maps_url
                 else (
-                    f"{complaint.latitude:.4f}, {complaint.longitude:.4f}"
-                    if complaint.latitude is not None and complaint.longitude is not None
+                    f"{target_lat:.4f}, {target_lon:.4f}"
+                    if target_lat is not None and target_lon is not None
                     else "Unspecified Location"
                 )
             )
@@ -111,9 +118,9 @@ class DuplicateDetector:
                         # Clearly identify as a provisional anchor; does not trigger automated municipal dispatch
                         anchor = PhysicalIssue(
                             issue_reference_id=issue_ref,
-                            category=complaint.category,
-                            representative_latitude=complaint.latitude if complaint.latitude is not None else 0.0,
-                            representative_longitude=complaint.longitude if complaint.longitude is not None else 0.0,
+                            category=target_category,
+                            representative_latitude=target_lat if target_lat is not None else 0.0,
+                            representative_longitude=target_lon if target_lon is not None else 0.0,
                             representative_location=f"Provisional Cluster ({rep_location})",
                             description=f"[Provisional Issue Anchor] {complaint.description}",
                             current_status="Open",
@@ -143,35 +150,17 @@ class DuplicateDetector:
                         if not is_issue_reference_id_collision(err):
                             raise
 
-                        if target_lat is not None and target_lon is not None:
-                            existing_exact = db.query(PhysicalIssue).filter(
-                                PhysicalIssue.category == target_category,
-                                PhysicalIssue.representative_latitude >= target_lat - lat_tol,
-                                PhysicalIssue.representative_latitude <= target_lat + lat_tol,
-                                PhysicalIssue.representative_longitude >= target_lon - lon_tol,
-                                PhysicalIssue.representative_longitude <= target_lon + lon_tol,
-                            ).first()
+                        if attempt < max_anchor_attempts - 1:
+                            # Reacquire spatial advisory lock since transaction rollback released it in PostgreSQL
+                            _acquire_spatial_lock()
+
+                            # Recheck whether another transaction committed an anchor at this location
+                            existing_exact = _find_existing_exact_anchor()
                             if existing_exact:
-                                target_complaint = db.query(Complaint).filter(Complaint.complaint_id == complaint_id).first() or complaint
-                                target_complaint.issue_id = existing_exact.issue_reference_id
-                                target_complaint.updated_at = utc_now()
-                                link_event = ComplaintEvent(
-                                    complaint_id=complaint_id,
-                                    event_type="provisional_issue_anchor_linked",
-                                    previous_value=None,
-                                    new_value=existing_exact.issue_reference_id,
-                                    description=(
-                                        f"Associated complaint with existing provisional Physical Issue anchor "
-                                        f"{existing_exact.issue_reference_id} after concurrency resolution."
-                                    ),
-                                    source="ai_duplicate_detector",
-                                    created_at=utc_now(),
-                                )
-                                db.add(link_event)
-                                db.commit()
+                                # Return the existing anchor without automatically linking the complaint;
+                                # it will be processed through the human review duplicate match workflow.
                                 return existing_exact
 
-                        if attempt < max_anchor_attempts - 1:
                             continue
                         raise
 
@@ -239,7 +228,7 @@ class DuplicateDetector:
                     Complaint.latitude <= max_lat,
                     Complaint.longitude >= min_lon,
                     Complaint.longitude <= max_lon,
-                    Complaint.created_at <= complaint.created_at
+                    (Complaint.created_at < complaint.created_at) | ((Complaint.created_at == complaint.created_at) & (Complaint.id < complaint.id))
                 )
                 .order_by(Complaint.created_at.asc(), Complaint.id.asc())
                 .all()
@@ -269,8 +258,22 @@ class DuplicateDetector:
         # 3. If still no candidates found, establish provisional anchor for this complaint
         if len(candidates) == 0:
             if not complaint.issue_id:
-                cls._create_provisional_anchor(complaint, db)
+                anchor = cls._create_provisional_anchor(complaint, db)
+                if anchor and complaint.issue_id != anchor.issue_reference_id:
+                    # An anchor already existed at these coordinates.
+                    # Do NOT silently associate; treat as candidate for human review.
+                    dist = 0.0
+                    if complaint.latitude is not None and complaint.longitude is not None:
+                        dist = calculate_haversine_distance(
+                            complaint.latitude,
+                            complaint.longitude,
+                            anchor.representative_latitude,
+                            anchor.representative_longitude,
+                        )
+                    candidates.append((anchor, round(dist, 2)))
 
+        # 4. If still no candidates found, this is an independent clean report
+        if len(candidates) == 0:
             event = ComplaintEvent(
                 complaint_id=complaint.complaint_id,
                 event_type="duplicate_evaluation_clean",

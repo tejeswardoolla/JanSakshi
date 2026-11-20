@@ -996,7 +996,7 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
 
         # Call public unauthenticated endpoint without token
         public_resp = asyncio.run(
-            get_complaint_duplicate_candidates(complaint_id=c1.complaint_id, db=self.db, token=None)
+            get_complaint_duplicate_candidates(complaint_id=c2.complaint_id, db=self.db, token=None)
         )
         self.assertGreaterEqual(len(public_resp), 1)
         for match in public_resp:
@@ -1008,7 +1008,7 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
 
         # Call with invalid token
         invalid_resp = asyncio.run(
-            get_complaint_duplicate_candidates(complaint_id=c1.complaint_id, db=self.db, token="invalid-token")
+            get_complaint_duplicate_candidates(complaint_id=c2.complaint_id, db=self.db, token="invalid-token")
         )
         self.assertGreaterEqual(len(invalid_resp), 1)
         for match in invalid_resp:
@@ -1660,20 +1660,19 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
             else:
                 return real_commit()
 
-        # Simulate collision on first commit attempt, then recovery linking to winning anchor
+        # Simulate collision on first commit attempt, then recovery returning winning anchor without silent auto-association
         with patch.object(self.db, "commit", side_effect=side_effect_commit):
             anchor = DuplicateDetector._create_provisional_anchor(complaint, self.db)
             self.assertEqual(anchor.issue_reference_id, "ISSUE-2026-WINNING")
             self.db.refresh(complaint)
-            self.assertEqual(complaint.issue_id, "ISSUE-2026-WINNING")
+            self.assertIsNone(complaint.issue_id, "Subsequent complaint must not be auto-linked without authority approval")
 
-            # Verify provisional_issue_anchor_linked audit event was created
+            # Verify no auto-linking audit event was created
             link_event = self.db.query(ComplaintEvent).filter_by(
                 complaint_id=complaint.complaint_id,
                 event_type="provisional_issue_anchor_linked"
             ).first()
-            self.assertIsNotNone(link_event)
-            self.assertEqual(link_event.new_value, "ISSUE-2026-WINNING")
+            self.assertIsNone(link_event, "No auto-link audit event should be created before review")
 
     def test_39_id_generation_failure_triggers_rollback_and_propagates_exception(self):
         """39. Database failure during ID generation rolls back the session and propagates original exception."""
@@ -1734,6 +1733,264 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
 
                 self.assertIn("Simulated DB query timeout during initial existing-anchor lookup", str(cm.exception))
                 self.assertGreaterEqual(mock_rollback.call_count, 1, "Must call db.rollback() on initial lookup failure")
+
+    def test_41_existing_exact_anchor_does_not_silently_associate_complaint(self):
+        """41. An existing exact anchor at same coordinates returns the anchor without silently associating the complaint."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue
+
+        # Pre-existing anchor in DB
+        anchor = PhysicalIssue(
+            issue_reference_id="ISSUE-2026-PREEXIST",
+            category="Road Damage / Potholes",
+            representative_latitude=16.9936,
+            representative_longitude=81.7762,
+            representative_location="Main Bazaar",
+            description="[Provisional Issue Anchor] Pre-existing crater",
+            current_status="Open",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        self.db.add(anchor)
+        self.db.commit()
+
+        # New unassociated complaint at exact same coordinates
+        c_new = self._create_test_complaint(
+            citizen_id="citizen-independent-1",
+            category="Road Damage / Potholes",
+            lat=16.9936,
+            lon=81.7762,
+            desc="Different citizen reporting the same crater"
+        )
+        self.assertIsNone(c_new.issue_id)
+
+        returned_anchor = DuplicateDetector._create_provisional_anchor(c_new, self.db)
+        self.assertEqual(returned_anchor.issue_reference_id, "ISSUE-2026-PREEXIST")
+
+        # Crucial check: c_new.issue_id MUST NOT be automatically assigned!
+        self.db.refresh(c_new)
+        self.assertIsNone(c_new.issue_id, "Complaint must preserve independence and not be silently auto-associated")
+
+    def test_42_complaint_at_existing_anchor_receives_pending_review_candidate(self):
+        """42. Evaluating a complaint at an existing anchor creates a pending DuplicateMatch for authority review."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue, DuplicateMatch
+
+        anchor = PhysicalIssue(
+            issue_reference_id="ISSUE-2026-REVIEW-ME",
+            category="Road Damage / Potholes",
+            representative_latitude=16.9936,
+            representative_longitude=81.7762,
+            representative_location="Main Bazaar",
+            description="[Provisional Issue Anchor] Pre-existing crater for review test",
+            current_status="Open",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        self.db.add(anchor)
+        self.db.commit()
+
+        c = self._create_test_complaint(
+            citizen_id="citizen-cand-1",
+            category="Road Damage / Potholes",
+            lat=16.9936,
+            lon=81.7762,
+            desc="Pothole at the same spot"
+        )
+
+        matches = DuplicateDetector.evaluate_complaint(c.complaint_id, self.db)
+        self.assertEqual(len(matches), 1, "Must generate exactly 1 candidate duplicate match")
+        self.assertEqual(matches[0].candidate_physical_issue_id, "ISSUE-2026-REVIEW-ME")
+        self.assertEqual(matches[0].review_status, "pending")
+
+        # Confirm unlinked before approval
+        self.db.refresh(c)
+        self.assertIsNone(c.issue_id, "Complaint must not be linked prior to manual approval")
+
+        # Approve the match and verify association occurs ONLY on approval
+        DuplicateDetector.approve_match(self.db, match_id=matches[0].id, reviewer_id="Officer Smith")
+        self.db.refresh(c)
+        self.assertEqual(c.issue_id, "ISSUE-2026-REVIEW-ME", "Complaint must be linked after authority approval")
+
+    def test_43_rejected_candidate_remains_independently_recorded(self):
+        """43. A rejected candidate match leaves complaint independent and records audit event."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue, DuplicateMatch, ComplaintEvent
+
+        anchor = PhysicalIssue(
+            issue_reference_id="ISSUE-2026-REJECT-TEST",
+            category="Sanitation",
+            representative_latitude=16.5000,
+            representative_longitude=80.5000,
+            representative_location="Dump Yard",
+            description="[Provisional Issue Anchor] Garbage cluster",
+            current_status="Open",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        self.db.add(anchor)
+        self.db.commit()
+
+        c = self._create_test_complaint(
+            citizen_id="citizen-rej-1",
+            category="Sanitation",
+            lat=16.5000,
+            lon=80.5000,
+            desc="Separate distinct pile of commercial debris"
+        )
+
+        matches = DuplicateDetector.evaluate_complaint(c.complaint_id, self.db)
+        self.assertEqual(len(matches), 1)
+        match_id = matches[0].id
+
+        # Authority officer inspects and rejects because it is a distinct problem
+        res = DuplicateDetector.reject_match(
+            self.db,
+            match_id=match_id,
+            reviewer_id="Officer Johnson",
+            review_reason="Distinct commercial debris needing independent tractor"
+        )
+        self.assertEqual(res["status"], "success")
+        self.assertEqual(res["review_status"], "rejected")
+
+        # Confirm the rejected match is recorded in DB
+        match_record = self.db.query(DuplicateMatch).filter_by(id=match_id).first()
+        self.assertEqual(match_record.review_status, "rejected")
+        self.assertEqual(match_record.reviewer_id, "Officer Johnson")
+
+        # Confirm rejection event
+        event = self.db.query(ComplaintEvent).filter_by(
+            complaint_id=c.complaint_id,
+            event_type="issue_association_rejected"
+        ).first()
+        self.assertIsNotNone(event)
+        self.assertEqual(event.previous_value, "ISSUE-2026-REJECT-TEST")
+
+    def test_44_spatial_lock_is_reacquired_after_failed_transaction_before_retry(self):
+        """44. Spatial advisory lock is reacquired after a failed transaction collision rollback before retry."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from sqlalchemy.exc import IntegrityError
+        from sqlalchemy import text
+
+        complaint = self._create_test_complaint(
+            citizen_id="citizen-reacquire-1",
+            category="Roads",
+            lat=16.8800,
+            lon=80.8800,
+            desc="Testing lock reacquisition"
+        )
+
+        collision_err = IntegrityError(
+            "UNIQUE constraint failed: physical_issues.issue_reference_id",
+            params={},
+            orig=Exception("UNIQUE constraint failed: physical_issues.issue_reference_id")
+        )
+
+        lock_calls = []
+        real_execute = self.db.execute
+
+        def spy_execute(statement, *args, **kwargs):
+            stmt_str = str(statement)
+            if "pg_advisory_xact_lock" in stmt_str:
+                lock_calls.append(kwargs.get("params") or args)
+                return MagicMock()
+            return real_execute(statement, *args, **kwargs)
+
+        attempt = 0
+        real_commit = self.db.commit
+        def side_effect_commit():
+            nonlocal attempt
+            attempt += 1
+            if attempt == 1:
+                raise collision_err
+            return real_commit()
+
+        with patch("app.services.issue_id_service.get_verified_database_dialect", return_value="postgresql"):
+            with patch.object(self.db, "execute", side_effect=spy_execute):
+                with patch.object(self.db, "commit", side_effect=side_effect_commit):
+                    anchor = DuplicateDetector._create_provisional_anchor(complaint, self.db)
+                    self.assertIsNotNone(anchor)
+
+        # In PostgreSQL, pg_advisory_xact_lock must be acquired on attempt 1 AND reacquired on attempt 2 after rollback!
+        self.assertGreaterEqual(
+            len(lock_calls),
+            2,
+            f"Expected spatial advisory lock to be acquired initially and reacquired after collision rollback, got {len(lock_calls)} calls"
+        )
+
+    def test_45_concurrent_same_location_requests_cannot_create_duplicate_anchors_after_collision_rollback(self):
+        """45. Concurrent same-location requests resolve to exactly one canonical anchor; no duplicates created."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue
+
+        c1 = self._create_test_complaint("cit-conc-1", "Water Supply", 16.5500, 80.5500, "Burst pipe report 1")
+        c2 = self._create_test_complaint("cit-conc-2", "Water Supply", 16.5500, 80.5500, "Burst pipe report 2")
+
+        # Run concurrent anchor creation via thread pool
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            fut1 = executor.submit(DuplicateDetector._create_provisional_anchor, c1, self.db)
+            fut2 = executor.submit(DuplicateDetector._create_provisional_anchor, c2, self.db)
+            anchor1 = fut1.result()
+            anchor2 = fut2.result()
+
+        # Both complaints must receive the EXACT same canonical anchor
+        self.assertEqual(anchor1.issue_reference_id, anchor2.issue_reference_id)
+
+        # In DB, exactly 1 PhysicalIssue should exist for this location and category
+        anchors_in_db = self.db.query(PhysicalIssue).filter(
+            PhysicalIssue.category == "Water Supply",
+            PhysicalIssue.representative_latitude >= 16.5499,
+            PhysicalIssue.representative_latitude <= 16.5501,
+            PhysicalIssue.representative_longitude >= 80.5499,
+            PhysicalIssue.representative_longitude <= 80.5501,
+        ).all()
+        self.assertEqual(len(anchors_in_db), 1, "Exactly one canonical anchor must exist for the location")
+
+    def test_46_coordinate_boundary_race_prevention(self):
+        """46. Boundary coordinates (e.g. 16.10004 vs 16.10006) share unified advisory lock and resolve to 1 anchor."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue
+
+        # 16.10004 and 16.10006 are ~2.2 metres apart, well within tolerance 0.0001 deg (~11 metres)
+        # Old 4-decimal formatting: 16.10004 -> "16.1000", 16.10006 -> "16.1001" (split lock keys)
+        # Unified locking: both use "jansakshi_provisional_anchor_mutex"
+        c1 = self._create_test_complaint("cit-bound-1", "Sanitation", 16.10004, 80.10004, "Garbage at boundary 1")
+        c2 = self._create_test_complaint("cit-bound-2", "Sanitation", 16.10006, 80.10006, "Garbage at boundary 2")
+
+        lock_keys_used = []
+        real_execute = self.db.execute
+
+        def spy_execute(statement, *args, **kwargs):
+            stmt_str = str(statement)
+            if "pg_advisory_xact_lock" in stmt_str:
+                params = kwargs.get("params") or (args[0] if args else {})
+                if isinstance(params, dict) and "k" in params:
+                    lock_keys_used.append(params["k"])
+                return MagicMock()
+            return real_execute(statement, *args, **kwargs)
+
+        with patch("app.services.issue_id_service.get_verified_database_dialect", return_value="postgresql"):
+            with patch.object(self.db, "execute", side_effect=spy_execute):
+                anchor1 = DuplicateDetector._create_provisional_anchor(c1, self.db)
+                anchor2 = DuplicateDetector._create_provisional_anchor(c2, self.db)
+
+        # Both calls must acquire the unified lock key, NOT coordinate-rounded split keys
+        self.assertIn("jansakshi_provisional_anchor_mutex", lock_keys_used)
+        provisional_locks = [k for k in lock_keys_used if "provisional_anchor" in k or "jansakshi_anchor" in k]
+        self.assertEqual(len(provisional_locks), 2, "Both calls must acquire provisional anchor mutex")
+        for key in provisional_locks:
+            self.assertEqual(key, "jansakshi_provisional_anchor_mutex", "All provisional lock calls must use the unified mutex key")
+
+        # Both complaints must resolve to the identical canonical anchor
+        self.assertEqual(anchor1.issue_reference_id, anchor2.issue_reference_id)
+
+        # Only 1 PhysicalIssue anchor must exist in the database for this boundary cluster
+        anchors = self.db.query(PhysicalIssue).filter(
+            PhysicalIssue.category == "Sanitation",
+            PhysicalIssue.representative_latitude >= 16.10004 - 0.0001,
+            PhysicalIssue.representative_latitude <= 16.10006 + 0.0001,
+        ).all()
+        self.assertEqual(len(anchors), 1, "Exactly one canonical anchor must be created despite split decimal rounding")
 
 
 if __name__ == "__main__":
