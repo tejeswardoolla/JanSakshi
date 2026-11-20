@@ -69,6 +69,41 @@ def get_db():
 RAW_LOCK_URL = os.getenv("GMAIL_LOCK_DATABASE_URL", "").strip()
 GMAIL_LOCK_DATABASE_URL = normalize_database_url(RAW_LOCK_URL) if RAW_LOCK_URL else ""
 
+def validate_lock_url_matches_database(lock_url: str, app_url: str):
+    """
+    Validates that GMAIL_LOCK_DATABASE_URL points to the same Neon database and cluster as DATABASE_URL,
+    without exposing or logging credentials.
+    """
+    if not lock_url or not app_url:
+        return
+    import urllib.parse
+    try:
+        p_lock = urllib.parse.urlparse(lock_url)
+        p_app = urllib.parse.urlparse(app_url)
+    except Exception:
+        return
+
+    # Check database name (e.g. /neondb)
+    db_lock = p_lock.path.strip('/')
+    db_app = p_app.path.strip('/')
+    if db_lock and db_app and db_lock != db_app:
+        raise ValueError(
+            f"GMAIL_LOCK_DATABASE_URL targets database '{db_lock}', but DATABASE_URL targets '{db_app}'. "
+            f"The dedicated lock engine must point to the same database."
+        )
+
+    # Check host / cluster (stripping -pooler from both)
+    host_lock = (p_lock.hostname or "").lower()
+    host_app = (p_app.hostname or "").lower()
+    if host_lock and host_app:
+        base_lock = host_lock.replace("-pooler", "")
+        base_app = host_app.replace("-pooler", "")
+        if base_lock != base_app:
+            raise ValueError(
+                f"GMAIL_LOCK_DATABASE_URL host ('{p_lock.hostname}') does not match DATABASE_URL cluster ('{base_app}'). "
+                f"The dedicated lock engine must target the direct endpoint of the same Neon database cluster."
+            )
+
 def get_lock_engine():
     """
     Returns a dedicated, unpooled Engine exclusively for session-level PostgreSQL advisory locks.
@@ -82,6 +117,8 @@ def get_lock_engine():
         if GMAIL_LOCK_DATABASE_URL.startswith("postgresql"):
             if "-pooler" in GMAIL_LOCK_DATABASE_URL:
                 raise ValueError("GMAIL_LOCK_DATABASE_URL is misconfigured: points to a pooled (-pooler) endpoint. Direct endpoint required.")
+            if is_postgres and DATABASE_URL:
+                validate_lock_url_matches_database(GMAIL_LOCK_DATABASE_URL, DATABASE_URL)
             return create_engine(GMAIL_LOCK_DATABASE_URL, poolclass=NullPool, connect_args={"connect_timeout": 15})
         return create_engine(GMAIL_LOCK_DATABASE_URL, poolclass=NullPool)
 
@@ -131,7 +168,12 @@ def ensure_email_message_schema(bind=None):
         # On PostgreSQL, use verified direct unpooled lock engine from get_lock_engine()
         # unless an explicit test bind was provided
         migration_engine = get_lock_engine() if (is_pg and bind is None) else target_engine
-        conn = migration_engine.connect()
+        try:
+            conn = migration_engine.connect()
+        except Exception as conn_err:
+            logger.error(f"Failed to check out dedicated lock connection for schema migration: {conn_err}")
+            raise RuntimeError(f"Database migration failure: unable to connect to database for migration: {conn_err}") from conn_err
+
         lock_acquired = False
         try:
             # On PostgreSQL, acquire dedicated session advisory lock during migration

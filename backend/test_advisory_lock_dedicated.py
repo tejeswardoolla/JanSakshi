@@ -450,5 +450,91 @@ class TestEnsureEmailMessageSchemaMigration(unittest.TestCase):
                     mock_get_lock.assert_called_once()
                     mock_lock_engine.connect.assert_called_once()
 
+    def test_startup_lifespan_exercises_schema_migration_with_lock_engine(self):
+        """FastAPI lifespan startup executes ensure_email_message_schema() without bind, using get_lock_engine() on PostgreSQL."""
+        from app.main import lifespan
+        mock_app = MagicMock()
+
+        mock_lock_engine = MagicMock()
+        mock_lock_engine.dialect.name = "postgresql"
+        mock_lock_conn = MagicMock()
+        mock_lock_conn.execute.side_effect = [
+            MagicMock(),  # pg_advisory_lock
+            MagicMock(scalar=lambda: True),  # pg_advisory_unlock
+        ]
+        mock_lock_engine.connect.return_value = mock_lock_conn
+
+        mock_inspector = MagicMock()
+        mock_inspector.get_table_names.return_value = ["email_messages"]
+        mock_inspector.get_columns.return_value = [
+            {"name": "id"},
+            {"name": "acknowledgement_retry_count"},
+            {"name": "acknowledgement_last_retry_at"}
+        ]
+
+        with patch("app.main.engine") as mock_app_engine, \
+             patch("app.database.engine") as mock_db_engine, \
+             patch("app.database.get_lock_engine", return_value=mock_lock_engine) as mock_get_lock, \
+             patch("sqlalchemy.inspect", return_value=mock_inspector), \
+             patch("app.main.Base.metadata.create_all"):
+            mock_app_engine.dialect.name = "postgresql"
+            mock_db_engine.dialect.name = "postgresql"
+
+            import asyncio
+            async def run_startup():
+                async with lifespan(mock_app):
+                    pass
+            asyncio.run(run_startup())
+
+            # Verified: get_lock_engine was called during startup migration and dedicated connection was checked out
+            mock_get_lock.assert_called()
+            mock_lock_engine.connect.assert_called_once()
+
+    def test_schema_migration_aborts_if_lock_connection_unavailable(self):
+        """When dedicated lock connection cannot be established, migration aborts loudly with RuntimeError."""
+        mock_lock_engine = MagicMock()
+        mock_lock_engine.dialect.name = "postgresql"
+        mock_lock_engine.connect.side_effect = Exception("psycopg.errors.ConnectionTimeout: Neon direct endpoint unreachable")
+
+        with patch("app.database.engine") as mock_default_engine:
+            mock_default_engine.dialect.name = "postgresql"
+            with patch("app.database.get_lock_engine", return_value=mock_lock_engine):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_email_message_schema(bind=None)
+                self.assertIn("unable to connect to database for migration", str(ctx.exception))
+                self.assertIn("Neon direct endpoint unreachable", str(ctx.exception))
+
+    def test_validate_lock_url_matches_database_success(self):
+        """Matching Neon direct and pooled URLs targeting the same database succeed validation."""
+        from app.database import validate_lock_url_matches_database
+        lock_url = "postgresql://user:pass@ep-cool-123.us-east-1.aws.neon.tech/neondb?sslmode=require"
+        app_url = "postgresql://user:pass@ep-cool-123-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require"
+        # Should complete without exception
+        validate_lock_url_matches_database(lock_url, app_url)
+
+    def test_validate_lock_url_matches_database_name_mismatch(self):
+        """Mismatched database names raise ValueError without logging credentials."""
+        from app.database import validate_lock_url_matches_database
+        lock_url = "postgresql://user:super_secret_pw@ep-cool-123.us-east-1.aws.neon.tech/wrong_db?sslmode=require"
+        app_url = "postgresql://user:super_secret_pw@ep-cool-123-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require"
+
+        with self.assertRaises(ValueError) as ctx:
+            validate_lock_url_matches_database(lock_url, app_url)
+        err = str(ctx.exception)
+        self.assertIn("targets database 'wrong_db', but DATABASE_URL targets 'neondb'", err)
+        self.assertNotIn("super_secret_pw", err)
+
+    def test_validate_lock_url_matches_database_host_mismatch(self):
+        """Mismatched database clusters raise ValueError without logging credentials."""
+        from app.database import validate_lock_url_matches_database
+        lock_url = "postgresql://user:super_secret_pw@ep-other-cluster.us-east-1.aws.neon.tech/neondb?sslmode=require"
+        app_url = "postgresql://user:super_secret_pw@ep-cool-123-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require"
+
+        with self.assertRaises(ValueError) as ctx:
+            validate_lock_url_matches_database(lock_url, app_url)
+        err = str(ctx.exception)
+        self.assertIn("does not match DATABASE_URL cluster", err)
+        self.assertNotIn("super_secret_pw", err)
+
 if __name__ == "__main__":
     unittest.main()

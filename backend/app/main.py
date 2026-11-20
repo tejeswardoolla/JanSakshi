@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
                 )
         Base.metadata.create_all(bind=engine)
         from app.database import ensure_email_message_schema
-        ensure_email_message_schema(bind=engine)
+        ensure_email_message_schema()
     except Exception as db_err:
         logger.error(f"[DATABASE ERROR] Startup database verification failed: {db_err}")
         raise RuntimeError(f"Application startup aborted due to database initialization failure: {db_err}") from db_err
