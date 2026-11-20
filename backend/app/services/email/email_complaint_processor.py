@@ -235,6 +235,8 @@ class EmailComplaintProcessor:
             # ------------------------------------------------------------------
             saved_evidence = []
             attachments_info = []
+            failed_attachments = []
+
             for att in attachments:
                 meta = AttachmentProcessor.process_attachment(
                     filename=att["filename"],
@@ -245,13 +247,34 @@ class EmailComplaintProcessor:
                     saved_evidence.append(meta)
                     attachments_info.append({
                         "filename": meta["original_filename"],
+                        "stored_filename": meta.get("stored_filename"),
                         "file_size": meta["file_size"],
-                        "file_type": meta["file_type"]
+                        "file_type": meta["file_type"],
+                        "status": "stored",
+                        "storage_path": meta.get("storage_path")
                     })
+                else:
+                    file_sz = len(att.get("data", b""))
+                    failed_item = {
+                        "filename": att["filename"],
+                        "file_size": file_sz,
+                        "file_type": att.get("mime_type") or "application/octet-stream",
+                        "status": "upload_failed",
+                        "error": "Cloud storage upload failed in production (fail-closed)"
+                    }
+                    failed_attachments.append(failed_item)
+                    attachments_info.append(failed_item)
 
-            email_record.has_attachments = bool(saved_evidence)
-            email_record.attachments_count = len(saved_evidence)
+            email_record.has_attachments = bool(attachments)
+            email_record.attachments_count = len(attachments)
             email_record.attachments_info = json.dumps(attachments_info) if attachments_info else None
+
+            if failed_attachments:
+                failed_names = ", ".join(f["filename"] for f in failed_attachments)
+                err_msg = f"Attachment upload failed for: {failed_names}"
+                email_record.error_details = (
+                    f"{email_record.error_details}; {err_msg}" if email_record.error_details else err_msg
+                )
 
             # ------------------------------------------------------------------
             # 6. UNIFIED COMPLAINT PROCESSING PIPELINE EXECUTION
@@ -279,6 +302,25 @@ class EmailComplaintProcessor:
             email_record.processing_status = "awaiting_information" if (extraction.latitude is None) else "processed"
             db.commit()
 
+            # Record audit event for any failed attachment uploads so admins have complete visibility
+            for failed_item in failed_attachments:
+                fail_event = ComplaintEvent(
+                    complaint_id=complaint_record.complaint_id,
+                    event_type="attachment_upload_failed",
+                    previous_value=None,
+                    new_value=failed_item["filename"],
+                    description=(
+                        f"Attachment '{failed_item['filename']}' ({failed_item['file_size']} bytes) "
+                        f"failed to upload to cloud storage. Recorded on email record {email_record.gmail_message_id} "
+                        f"for administrative inspection."
+                    ),
+                    source="email_attachment_processor",
+                    created_at=utc_now()
+                )
+                db.add(fail_event)
+            if failed_attachments:
+                db.commit()
+
             # Record landmark and coordinate distinction in audit history
             if extraction.location_text:
                 coord_note = (
@@ -300,12 +342,17 @@ class EmailComplaintProcessor:
             # ------------------------------------------------------------------
             # 7. AUTOMATIC CITIZEN ACKNOWLEDGEMENT EMAIL
             # ------------------------------------------------------------------
-            AcknowledgementService.send_acknowledgement(
+            ack_sent = AcknowledgementService.send_acknowledgement(
                 db=db,
                 complaint=complaint_record,
                 email_record=email_record,
                 location_missing=(extraction.latitude is None)
             )
+            if not ack_sent:
+                logger.warning(
+                    f"Citizen acknowledgement email not dispatched for {complaint_record.complaint_id} "
+                    f"(Gmail service unavailable or delivery failed); will be eligible for retry."
+                )
 
             logger.info(f"Successfully created complaint {complaint_record.complaint_id} from email {gmail_msg_id}")
             return {

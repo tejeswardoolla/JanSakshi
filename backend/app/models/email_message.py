@@ -43,6 +43,8 @@ class EmailMessage(Base):
     acknowledgement_sent = Column(Boolean, default=False)
     acknowledgement_sent_at = Column(DateTime(timezone=True), nullable=True)
     acknowledgement_message_id = Column(String(128), nullable=True)
+    acknowledgement_retry_count = Column(Integer, default=0, nullable=False)
+    acknowledgement_last_retry_at = Column(DateTime(timezone=True), nullable=True)
 
     # Follow-up email flag
     is_follow_up = Column(Boolean, default=False)

@@ -1,9 +1,11 @@
 import logging
 import datetime
 import urllib.parse
+import hmac
+import os
 from typing import List, Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, status
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, Header, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
@@ -48,6 +50,8 @@ def _format_email_response(msg: EmailMessage) -> EmailMessageResponse:
         attachments_info=msg.attachments_info,
         acknowledgement_sent=bool(msg.acknowledgement_sent) if msg.acknowledgement_sent is not None else False,
         acknowledgement_sent_at=msg.acknowledgement_sent_at,
+        acknowledgement_retry_count=getattr(msg, "acknowledgement_retry_count", 0) or 0,
+        acknowledgement_last_retry_at=getattr(msg, "acknowledgement_last_retry_at", None),
         is_follow_up=bool(msg.is_follow_up) if msg.is_follow_up is not None else False,
         created_at=msg.created_at,
     )
@@ -156,6 +160,45 @@ async def retry_email_processing(
         background_tasks=background_tasks
     )
     return result
+
+@router.post("/messages/{message_id}/resend-acknowledgement")
+async def resend_acknowledgement(
+    message_id: int,
+    force_retry: bool = True,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin"]))
+):
+    """
+    Retries sending an acknowledgement email for a registered complaint if previously failed.
+    """
+    msg = db.query(EmailMessage).filter(EmailMessage.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Email record not found.")
+    if not msg.complaint_id:
+        raise HTTPException(status_code=400, detail="No complaint linked to this email message.")
+
+    complaint = db.query(Complaint).filter(Complaint.complaint_id == msg.complaint_id).first()
+    if not complaint:
+        raise HTTPException(status_code=404, detail=f"Linked complaint {msg.complaint_id} not found.")
+
+    from app.services.email.acknowledgement_service import AcknowledgementService
+    success = AcknowledgementService.send_acknowledgement(
+        db=db,
+        complaint=complaint,
+        email_record=msg,
+        location_missing=(complaint.latitude is None),
+        force_retry=force_retry
+    )
+    if not success:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to dispatch acknowledgement: {msg.error_details or 'Gmail sending failed'}"
+        )
+    return {
+        "status": "success",
+        "message": f"Acknowledgement email successfully sent to {msg.sender_email}",
+        "acknowledgement_message_id": msg.acknowledgement_message_id
+    }
 
 @router.post("/messages/{message_id}/re-extract", response_model=EmailMessageResponse)
 async def re_extract_email_message(
@@ -357,6 +400,76 @@ async def mark_email_non_civic(
         "message": "Message successfully marked as non-civic and ignored.",
         "message_id": msg.id
     }
+
+def verify_cron_secret(authorization: Optional[str] = Header(None)) -> bool:
+    """
+    Validates that the incoming request carries a valid Bearer token matching CRON_SECRET.
+    Uses constant-time comparison via hmac.compare_digest to prevent timing attacks.
+    """
+    from app.core.config import CRON_SECRET
+    secret = (CRON_SECRET or os.getenv("CRON_SECRET", "")).strip()
+    if not secret:
+        logger.error("Cron sync rejected: CRON_SECRET is not configured on this instance.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Cron synchronization is not configured or disabled."
+        )
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization header."
+        )
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization scheme. Expected 'Bearer <token>'."
+        )
+    if not hmac.compare_digest(token.strip(), secret):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid cron secret token."
+        )
+    return True
+
+@router.post("/cron-sync")
+async def cron_sync_inbox(
+    background_tasks: BackgroundTasks,
+    response: Response,
+    max_messages: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+    _authorized: bool = Depends(verify_cron_secret),
+):
+    """
+    Scheduled Gmail inbox synchronization endpoint triggered by external runners (e.g. GitHub Actions).
+    Secured with Bearer token authentication matching CRON_SECRET.
+    Respects GMAIL_ENABLED setting and prevents concurrent runs using PostgreSQL advisory locking.
+    Returns HTTP 500 when synchronization encounters an unhandled error so runners detect failure.
+    """
+    from app.core.config import GMAIL_ENABLED
+    is_enabled = GMAIL_ENABLED or os.getenv("GMAIL_ENABLED", "false").lower() in ("true", "1", "yes")
+    if not is_enabled:
+        logger.info("Cron sync skipped: GMAIL_ENABLED is false.")
+        return {
+            "status": "disabled",
+            "message": "Gmail integration is disabled (GMAIL_ENABLED is false).",
+            "messages_checked": 0,
+            "civic_complaints_found": 0,
+            "processed": 0
+        }
+
+    result = await InboxMonitor.sync_inbox(
+        db=db,
+        max_messages=max_messages,
+        background_tasks=background_tasks
+    )
+
+    if result.get("status") == "error":
+        if response is not None:
+            response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        logger.error(f"Cron synchronization failed: {result.get('error')}")
+
+    return result
 
 @router.post("/sync")
 async def trigger_inbox_sync(

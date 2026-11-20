@@ -5,6 +5,7 @@ department assignment, administrative status transitions, escalation controls, a
 """
 
 import os
+import json
 from typing import Optional, List
 import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, UploadFile, File, Form, status
@@ -626,9 +627,30 @@ async def get_authority_complaint_detail(
             "stored_filename": ev.stored_filename,
             "file_type": ev.file_type,
             "file_size": ev.file_size,
+            "status": "stored",
             "view_url": f"/api/authority/evidence/{ev.stored_filename}",
             "created_at": ev.created_at.isoformat() if ev.created_at else None
         })
+
+    # Failed email attachments if any (e.g. cloud upload failed in production)
+    failed_evidence_list = []
+    for em in c.email_messages:
+        if em.attachments_info:
+            try:
+                raw_info = json.loads(em.attachments_info)
+                for item in raw_info:
+                    if isinstance(item, dict) and item.get("status") == "upload_failed":
+                        failed_evidence_list.append({
+                            "original_filename": item.get("filename"),
+                            "file_size": item.get("file_size"),
+                            "file_type": item.get("file_type"),
+                            "status": "upload_failed",
+                            "error": item.get("error", "Cloud storage upload failed"),
+                            "view_url": None,
+                            "email_message_id": em.gmail_message_id
+                        })
+            except Exception:
+                pass
 
     # AI Analyses list
     ai_list = []
@@ -757,6 +779,7 @@ async def get_authority_complaint_detail(
         "escalated_to": c.escalated_to,
         "internal_notes": sanitized_internal_notes,
         "evidence": evidence_list,
+        "failed_evidence": failed_evidence_list,
         "ai_analyses": ai_list,
         "duplicate_matches": dup_list,
         "audit_events": events_list,
