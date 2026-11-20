@@ -7,7 +7,7 @@ def generate_issue_reference_id(db: Session) -> str:
     Generate unique human-readable issue ID: ISSUE-YYYY-XXXXX
     e.g. ISSUE-2026-00001
     """
-    year = datetime.datetime.utcnow().year
+    year = datetime.datetime.now(datetime.timezone.utc).year
     prefix = f"ISSUE-{year}-"
 
     latest = (

@@ -20,6 +20,18 @@ router = APIRouter(prefix="/api/duplicates", tags=["Duplicate Detection"])
 def _format_match_response(match: DuplicateMatch) -> DuplicateMatchResponse:
     cand_issue = None
     if match.physical_issue:
+        associated_ids = [c.complaint_id for c in match.physical_issue.complaints]
+        associated_comps = [
+            {
+                "complaint_id": c.complaint_id,
+                "citizen_name": c.citizen_name,
+                "citizen_email": c.citizen_email,
+                "submission_channel": c.submission_channel,
+                "category": c.category,
+                "description": c.description,
+            }
+            for c in match.physical_issue.complaints
+        ]
         cand_issue = PhysicalIssueResponse(
             id=match.physical_issue.id,
             issue_reference_id=match.physical_issue.issue_reference_id,
@@ -32,6 +44,8 @@ def _format_match_response(match: DuplicateMatch) -> DuplicateMatchResponse:
             created_at=match.physical_issue.created_at,
             updated_at=match.physical_issue.updated_at,
             complaint_count=len(match.physical_issue.complaints),
+            associated_complaint_ids=associated_ids,
+            associated_complaints=associated_comps,
         )
     return DuplicateMatchResponse(
         id=match.id,
@@ -109,6 +123,9 @@ async def get_duplicate_review_queue(
                 complaint_longitude=comp.longitude,
                 complaint_created_at=comp.created_at,
                 evidence_count=len(comp.evidence_files),
+                citizen_name=comp.citizen_name,
+                citizen_email=comp.citizen_email,
+                submission_channel=comp.submission_channel,
             )
         )
     return queue_items
@@ -138,6 +155,7 @@ async def approve_duplicate_candidate(
             complaint_id=result["complaint_id"],
             issue_reference_id=result["issue_reference_id"],
             review_status=result["review_status"],
+            dismissed_sibling_count=result.get("dismissed_sibling_count", 0),
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

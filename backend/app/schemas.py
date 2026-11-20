@@ -1,6 +1,6 @@
 import re
 import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, field_serializer
 
 def serialize_to_utc_iso(dt: Optional[datetime.datetime]) -> Optional[str]:
@@ -134,6 +134,8 @@ class PhysicalIssueResponse(BaseModel):
     created_at: datetime.datetime
     updated_at: datetime.datetime
     complaint_count: int = 0
+    associated_complaint_ids: List[str] = []
+    associated_complaints: Optional[List[Dict[str, Any]]] = None
 
     @field_serializer("created_at", "updated_at")
     def serialize_dates(self, dt: datetime.datetime, _info):
@@ -258,10 +260,13 @@ class DuplicateReviewQueueItem(BaseModel):
     match: DuplicateMatchResponse
     complaint_category: str
     complaint_description: str
-    complaint_latitude: float
-    complaint_longitude: float
+    complaint_latitude: Optional[float] = None
+    complaint_longitude: Optional[float] = None
     complaint_created_at: datetime.datetime
     evidence_count: int
+    citizen_name: Optional[str] = None
+    citizen_email: Optional[str] = None
+    submission_channel: Optional[str] = "website"
 
     @field_serializer("complaint_created_at")
     def serialize_created_at(self, dt: datetime.datetime, _info):
@@ -278,6 +283,7 @@ class DuplicateReviewActionResponse(BaseModel):
     complaint_id: str
     review_status: str
     issue_reference_id: Optional[str] = None
+    dismissed_sibling_count: Optional[int] = 0
 
 class AssociateIssueRequest(BaseModel):
     issue_reference_id: Optional[str] = Field(None, description="Issue reference ID to associate with, or null to disassociate")
