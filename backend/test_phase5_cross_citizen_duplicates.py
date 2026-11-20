@@ -26,6 +26,7 @@ import sys
 import unittest
 import datetime
 import io
+import socket
 from unittest.mock import patch, MagicMock
 from concurrent.futures import ThreadPoolExecutor
 
@@ -38,8 +39,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session
 from PIL import Image
 
+import asyncio
+from app.core.config import utc_now
 from app.database import Base
 from app.models.complaint import Complaint, PhysicalIssue, Evidence, ComplaintEvent, DuplicateMatch
+from app.models.authority import User
 from app.services.duplicate_detection import DuplicateDetector
 from app.services.duplicate_detection.image_similarity import (
     validate_safe_evidence_url,
@@ -50,7 +54,17 @@ from app.services.duplicate_detection.image_similarity import (
 )
 from app.services.duplicate_detection.location_similarity import calculate_haversine_distance
 from app.schemas import DuplicateReviewQueueItem, DuplicateMatchResponse, PhysicalIssueResponse
-from app.routes.duplicates import _format_match_response
+from app.routes.duplicates import (
+    _format_match_response,
+    get_complaint_duplicate_candidates,
+    get_duplicate_review_queue,
+)
+from app.services.issue_id_service import (
+    generate_issue_reference_id,
+    acquire_postgres_issue_seq_lock,
+    get_verified_database_dialect,
+    is_issue_reference_id_collision,
+)
 
 # Shared in-memory database with StaticPool for cross-thread testing
 from sqlalchemy.pool import StaticPool
@@ -76,6 +90,24 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
     def tearDown(self):
         self.db.close()
         TestingSessionLocal.remove()
+
+    def _create_test_complaint(self, citizen_id, category, lat, lon, desc):
+        import uuid
+        c = Complaint(
+            complaint_id=f"JS-2026-{uuid.uuid4().hex[:6].upper()}",
+            citizen_name=f"Citizen {citizen_id}",
+            citizen_email=f"{citizen_id}@example.com",
+            category=category,
+            description=desc,
+            latitude=lat,
+            longitude=lon,
+            status="Received",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        self.db.add(c)
+        self.db.commit()
+        return c
 
     def test_01_first_complaint_creates_provisional_anchor(self):
         """1. When a geolocated complaint is evaluated and no anchor exists, a provisional anchor is created."""
@@ -512,8 +544,9 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         self.assertFalse(validate_safe_evidence_url("https://blob.vercel-storage.com:8443/image.jpg"))
 
         # G. Valid Verified Hosts (Must Pass)
-        self.assertTrue(validate_safe_evidence_url("https://blob.vercel-storage.com/evidence/uuid.jpg"))
-        self.assertTrue(validate_safe_evidence_url("https://store123.public.blob.vercel-storage.com/pothole.png"))
+        with patch("socket.getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("76.76.21.35", 443))]):
+            self.assertTrue(validate_safe_evidence_url("https://blob.vercel-storage.com/evidence/uuid.jpg"))
+            self.assertTrue(validate_safe_evidence_url("https://store123.public.blob.vercel-storage.com/pothole.png"))
 
     def test_13_download_size_cap_and_timeout(self):
         """13. Remote download enforces strict 10MB ceiling and rejects oversized responses."""
@@ -693,7 +726,9 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         self.assertIn("Automatically dismissed", m2.review_reason)
 
     def test_18_true_concurrency_anchor_creation(self):
-        """18. Concurrent multi-threaded anchor creation does not crash or generate duplicate anchors."""
+        """18. SQLite thread concurrency: Concurrent anchor creation under multi-threaded contention creates 1 canonical anchor."""
+        # Note: Validates SQLite file-locking and process-level threading mutex (_anchor_creation_lock).
+        # Multi-process distributed concurrency across separate server instances is enforced on PostgreSQL via pg_advisory_xact_lock.
         import tempfile
         # Create a temporary file-backed SQLite database to test true multi-connection concurrency
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
@@ -903,10 +938,11 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
             mock_resp.read.side_effect = [img_buf.getvalue(), b""]
             self.getresponse = MagicMock(return_value=mock_resp)
 
-        with patch.object(PinnedHTTPSConnection, "__init__", spy_init):
-            with patch.object(PinnedHTTPSConnection, "connect", spy_connect):
-                # Run the actual high-level image hashing function
-                dhash, ahash = compute_hashes_for_image(test_url)
+        with patch("socket.getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("76.76.21.35", 443))]):
+            with patch.object(PinnedHTTPSConnection, "__init__", spy_init):
+                with patch.object(PinnedHTTPSConnection, "connect", spy_connect):
+                    # Run the actual high-level image hashing function
+                    dhash, ahash = compute_hashes_for_image(test_url)
 
         # Verify integration:
         # 1. PinnedHTTPSConnection was instantiated
@@ -923,6 +959,782 @@ class TestCrossCitizenDuplicateDetection(unittest.TestCase):
         # 3. Hashes were successfully computed from the loaded response
         self.assertIsNotNone(dhash)
         self.assertIsNotNone(ahash)
+
+    def test_22_public_duplicate_endpoint_strips_citizen_pii(self):
+        """22. Public/unauthenticated duplicate candidate endpoint strips citizen name and email."""
+        c1 = Complaint(
+            complaint_id="JS-2026-PII-01",
+            category="Road Damage / Potholes",
+            description="Deep pothole in public avenue",
+            latitude=16.9936192,
+            longitude=81.776287,
+            status="Received",
+            citizen_name="Confidential Citizen",
+            citizen_email="citizen1@example.com",
+            submission_channel="website",
+        )
+        c2 = Complaint(
+            complaint_id="JS-2026-PII-02",
+            category="Road Damage / Potholes",
+            description="Crater in public avenue",
+            latitude=16.9936192,
+            longitude=81.776287,
+            status="Received",
+            citizen_name="Private Reporter",
+            citizen_email="citizen2@example.com",
+            submission_channel="gmail",
+        )
+        self.db.add_all([c1, c2])
+        self.db.commit()
+
+        DuplicateDetector.evaluate_complaint(c1.complaint_id, self.db)
+        matches = DuplicateDetector.evaluate_complaint(c2.complaint_id, self.db)
+        self.assertGreaterEqual(len(matches), 1)
+
+        # Approve candidate match so c2 is associated with the PhysicalIssue anchor
+        DuplicateDetector.approve_match(self.db, match_id=matches[0].id, reviewer_id="Admin Officer")
+
+        # Call public unauthenticated endpoint without token
+        public_resp = asyncio.run(
+            get_complaint_duplicate_candidates(complaint_id=c1.complaint_id, db=self.db, token=None)
+        )
+        self.assertGreaterEqual(len(public_resp), 1)
+        for match in public_resp:
+            if match.candidate_issue and match.candidate_issue.associated_complaints:
+                for comp_info in match.candidate_issue.associated_complaints:
+                    self.assertNotIn("citizen_name", comp_info, "Public response must not contain citizen_name")
+                    self.assertNotIn("citizen_email", comp_info, "Public response must not contain citizen_email")
+                    self.assertIn("complaint_id", comp_info)
+
+        # Call with invalid token
+        invalid_resp = asyncio.run(
+            get_complaint_duplicate_candidates(complaint_id=c1.complaint_id, db=self.db, token="invalid-token")
+        )
+        self.assertGreaterEqual(len(invalid_resp), 1)
+        for match in invalid_resp:
+            if match.candidate_issue and match.candidate_issue.associated_complaints:
+                for comp_info in match.candidate_issue.associated_complaints:
+                    self.assertNotIn("citizen_name", comp_info)
+                    self.assertNotIn("citizen_email", comp_info)
+
+    def test_23_admin_duplicate_review_queue_preserves_citizen_metadata(self):
+        """23. Admin duplicate review queue preserves citizen identity details for authorized administrators."""
+        c1 = Complaint(
+            complaint_id="JS-2026-ADMIN-01",
+            category="Streetlight Defect",
+            description="Dark pole near library",
+            latitude=17.385044,
+            longitude=78.486671,
+            status="Received",
+            citizen_name="Suresh Kumar",
+            citizen_email="suresh.k@example.com",
+            submission_channel="website",
+        )
+        c2 = Complaint(
+            complaint_id="JS-2026-ADMIN-02",
+            category="Streetlight Defect",
+            description="Pole light not glowing at night near library",
+            latitude=17.385044,
+            longitude=78.486671,
+            status="Received",
+            citizen_name="Ramesh Sharma",
+            citizen_email="ramesh.s@example.com",
+            submission_channel="gmail",
+        )
+        self.db.add_all([c1, c2])
+        self.db.commit()
+
+        DuplicateDetector.evaluate_complaint(c1.complaint_id, self.db)
+        matches = DuplicateDetector.evaluate_complaint(c2.complaint_id, self.db)
+        self.assertGreaterEqual(len(matches), 1)
+
+        admin_user = User(
+            id=999,
+            username="admin_reviewer",
+            full_name="Municipal Admin Officer",
+            email="admin@jansakshi.gov.in",
+            role="admin",
+            is_active=True,
+        )
+
+        queue_items = asyncio.run(
+            get_duplicate_review_queue(status_filter="all", confidence=None, db=self.db, current_user=admin_user)
+        )
+        self.assertGreater(len(queue_items), 0)
+
+        # Find the queue item for c2
+        c2_item = next((item for item in queue_items if item.match.complaint_id == c2.complaint_id), None)
+        self.assertIsNotNone(c2_item, "Queue item for c2 should be found")
+        self.assertEqual(c2_item.citizen_name, "Ramesh Sharma")
+        self.assertEqual(c2_item.citizen_email, "ramesh.s@example.com")
+
+        # Candidate issue must retain associated complaints with citizen metadata for admin
+        cand_issue = c2_item.match.candidate_issue
+        self.assertIsNotNone(cand_issue)
+        if cand_issue.associated_complaints:
+            c1_linked = next((c for c in cand_issue.associated_complaints if c["complaint_id"] == c1.complaint_id), None)
+            if c1_linked:
+                self.assertEqual(c1_linked.get("citizen_name"), "Suresh Kumar")
+                self.assertEqual(c1_linked.get("citizen_email"), "suresh.k@example.com")
+
+    def test_24_concurrent_anchor_creation_different_coordinates_unique_ids(self):
+        """24. SQLite thread concurrency: Concurrent anchor creation at different coordinates allocates distinct, unique PhysicalIssue IDs."""
+        # Note: Validates SQLite file-locking and process-level sequence mutex (_issue_id_seq_mutex).
+        # Multi-process distributed sequence isolation across separate server instances is enforced on PostgreSQL via pg_advisory_xact_lock.
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            temp_db_path = tf.name
+
+        try:
+            conc_engine = create_engine(
+                f"sqlite:///{temp_db_path}",
+                connect_args={"timeout": 30.0}
+            )
+            Base.metadata.create_all(bind=conc_engine)
+            ConcSessionFactory = sessionmaker(autocommit=False, autoflush=False, bind=conc_engine)
+
+            # 6 completely distinct coordinates
+            complaint_coords = [
+                ("JS-2026-DIFF-01", 16.10, 80.10, "Defect at Loc 1"),
+                ("JS-2026-DIFF-02", 16.60, 80.60, "Defect at Loc 2"),
+                ("JS-2026-DIFF-03", 17.10, 81.10, "Defect at Loc 3"),
+                ("JS-2026-DIFF-04", 17.60, 81.60, "Defect at Loc 4"),
+                ("JS-2026-DIFF-05", 18.10, 82.10, "Defect at Loc 5"),
+                ("JS-2026-DIFF-06", 18.60, 82.60, "Defect at Loc 6"),
+            ]
+
+            def worker_fn(item):
+                cid, lat, lon, desc = item
+                worker_db = ConcSessionFactory()
+                try:
+                    c = Complaint(
+                        complaint_id=cid,
+                        category="Sanitation",
+                        description=desc,
+                        latitude=lat,
+                        longitude=lon,
+                        status="Received",
+                    )
+                    worker_db.add(c)
+                    worker_db.commit()
+
+                    DuplicateDetector.evaluate_complaint(cid, worker_db)
+                    worker_db.refresh(c)
+                    return cid, c.issue_id
+                finally:
+                    worker_db.close()
+
+            with ThreadPoolExecutor(max_workers=len(complaint_coords)) as executor:
+                results = list(executor.map(worker_fn, complaint_coords))
+
+            verify_db = ConcSessionFactory()
+            anchors = verify_db.query(PhysicalIssue).filter(
+                PhysicalIssue.category == "Sanitation"
+            ).all()
+
+            # Every distinct coordinate must produce its own anchor
+            self.assertEqual(len(anchors), len(complaint_coords))
+            issue_ids = [a.issue_reference_id for a in anchors]
+
+            # All allocated issue reference IDs must be strictly unique
+            self.assertEqual(len(set(issue_ids)), len(complaint_coords), "Allocated PhysicalIssue IDs must be completely unique")
+            current_year = datetime.datetime.now(datetime.timezone.utc).year
+            for iid in issue_ids:
+                self.assertTrue(iid.startswith(f"ISSUE-{current_year}-"), f"Invalid ID format: {iid}")
+
+            verify_db.close()
+
+        finally:
+            try:
+                os.remove(temp_db_path)
+            except Exception:
+                pass
+
+    def test_25_postgres_issue_seq_lock_failure_fails_closed(self):
+        """25. When PostgreSQL sequence advisory lock acquisition fails, ID allocation and anchor creation fail closed."""
+        from sqlalchemy.exc import OperationalError
+
+        mock_pg_db = MagicMock()
+        mock_pg_db.get_bind.return_value.dialect.name = "postgresql"
+        mock_pg_db.execute.side_effect = OperationalError("statement timeout", params={}, orig=Exception("Seq Lock Timeout"))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            generate_issue_reference_id(mock_pg_db)
+
+        self.assertIn("PostgreSQL advisory lock acquisition failed for PhysicalIssue sequence", str(ctx.exception))
+        # Session rollback must be invoked
+        mock_pg_db.rollback.assert_called_once()
+
+    def test_26_live_neon_postgres_advisory_lock_multiconnection_sequence_isolation(self):
+        """26. Live Neon PostgreSQL integration: Multi-connection sequence advisory lock guarantees cross-process mutual exclusion."""
+        target_url = os.getenv("TARGET_DATABASE_URL", "").strip()
+        if not target_url:
+            env_file = os.path.join(backend_dir, ".env")
+            if os.path.exists(env_file):
+                with open(env_file, "r") as f:
+                    for line in f:
+                        if line.startswith("TARGET_DATABASE_URL="):
+                            target_url = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            break
+
+        if not target_url or not target_url.startswith("postgres"):
+            self.skipTest("TARGET_DATABASE_URL not configured with PostgreSQL; skipping live Neon multi-connection test.")
+
+        pg_engine = create_engine(target_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+        try:
+            with pg_engine.connect() as test_conn:
+                test_conn.execute(text("SELECT 1"))
+        except Exception as conn_err:
+            self.skipTest(f"Remote Neon PostgreSQL is unreachable ({conn_err}); skipping live test.")
+
+        year = datetime.datetime.now(datetime.timezone.utc).year
+        lock_key = f"jansakshi_seq_physical_issue_{year}"
+
+        # Connection 1 begins a transaction and acquires the sequence advisory transaction lock
+        with pg_engine.connect() as conn1:
+            trans1 = conn1.begin()
+            conn1.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": lock_key})
+
+            # Connection 2 attempts non-blocking acquisition of the same lock while conn1 holds it
+            with pg_engine.connect() as conn2:
+                with conn2.begin():
+                    acquired_conn2 = bool(
+                        conn2.execute(text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"), {"k": lock_key}).scalar()
+                    )
+                    self.assertFalse(
+                        acquired_conn2,
+                        "Independent connection 2 MUST NOT acquire the advisory lock while connection 1 holds it!"
+                    )
+
+            # Connection 1 completes its transaction
+            trans1.commit()
+
+        # After Connection 1 commits, Connection 2 can acquire the lock
+        with pg_engine.connect() as conn2_after:
+            with conn2_after.begin():
+                acquired_after = bool(
+                    conn2_after.execute(text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"), {"k": lock_key}).scalar()
+                )
+                self.assertTrue(acquired_after, "Connection 2 must successfully acquire lock after Connection 1 commits.")
+
+    def test_27_concurrent_physical_issue_service_create_issue_sqlite(self):
+        """27. Concurrent PhysicalIssueService.create_issue() calls across multiple threads on SQLite allocate unique IDs without collision."""
+        import tempfile
+        from app.services.issue_service import PhysicalIssueService
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            temp_db_path = tf.name
+
+        try:
+            conc_engine = create_engine(
+                f"sqlite:///{temp_db_path}",
+                connect_args={"timeout": 30.0}
+            )
+            Base.metadata.create_all(bind=conc_engine)
+            ConcSessionFactory = sessionmaker(autocommit=False, autoflush=False, bind=conc_engine)
+
+            thread_count = 8
+            issues_to_create = [
+                (f"Road Hazard {i}", 16.5 + (i * 0.05), 80.5 + (i * 0.05), f"Road issue description {i}")
+                for i in range(thread_count)
+            ]
+
+            def worker_fn(issue_args):
+                category, lat, lon, desc = issue_args
+                worker_db = ConcSessionFactory()
+                try:
+                    service = PhysicalIssueService(worker_db)
+                    created = service.create_issue(
+                        category=category,
+                        representative_latitude=lat,
+                        representative_longitude=lon,
+                        description=desc,
+                        representative_location=f"Location {lat:.2f}, {lon:.2f}"
+                    )
+                    return created.id, created.issue_reference_id
+                finally:
+                    worker_db.close()
+
+            with ThreadPoolExecutor(max_workers=thread_count) as executor:
+                results = list(executor.map(worker_fn, issues_to_create))
+
+            # Verify all thread results
+            self.assertEqual(len(results), thread_count)
+            allocated_ids = [r[1] for r in results]
+            self.assertEqual(len(set(allocated_ids)), thread_count, "All created PhysicalIssue reference IDs must be unique!")
+
+            # Verify in database
+            verify_db = ConcSessionFactory()
+            all_issues = verify_db.query(PhysicalIssue).all()
+            self.assertEqual(len(all_issues), thread_count)
+            db_ref_ids = [i.issue_reference_id for i in all_issues]
+            self.assertEqual(len(set(db_ref_ids)), thread_count)
+
+            year = datetime.datetime.now(datetime.timezone.utc).year
+            for ref in db_ref_ids:
+                self.assertTrue(ref.startswith(f"ISSUE-{year}-"), f"Invalid ID format: {ref}")
+
+            verify_db.close()
+        finally:
+            try:
+                os.remove(temp_db_path)
+            except Exception:
+                pass
+
+    def test_28_dialect_detection_failure_fails_closed(self):
+        """28. When database dialect identification fails completely, system fails closed by raising RuntimeError."""
+        mock_unknown_db = MagicMock()
+        mock_unknown_db.get_bind.return_value.dialect.name = "oracle_unknown"
+
+        with patch("app.database.is_postgres", False):
+            with patch("app.database.is_sqlite", False):
+                with self.assertRaises(RuntimeError) as ctx:
+                    get_verified_database_dialect(mock_unknown_db)
+
+                self.assertIn("Unable to verify database dialect for concurrency locking", str(ctx.exception))
+
+    def test_29_unique_id_collision_retry(self):
+        """29. When an issue_reference_id collision occurs, create_issue() retries with a new ID."""
+        from app.services.issue_service import PhysicalIssueService
+
+        # Pre-seed an existing issue
+        existing = PhysicalIssue(
+            issue_reference_id="ISSUE-2026-99991",
+            category="Roads",
+            representative_latitude=16.5,
+            representative_longitude=80.5,
+            description="Existing road issue",
+            current_status="Open",
+            created_at=datetime.datetime.now(datetime.timezone.utc),
+            updated_at=datetime.datetime.now(datetime.timezone.utc),
+        )
+        self.db.add(existing)
+        self.db.commit()
+
+        service = PhysicalIssueService(self.db)
+
+        # Mock generate_issue_reference_id to collide on first attempt, succeed on second
+        with patch(
+            "app.services.issue_service.generate_issue_reference_id",
+            side_effect=["ISSUE-2026-99991", "ISSUE-2026-99992"]
+        ) as mock_gen:
+            created = service.create_issue(
+                category="Roads",
+                representative_latitude=16.6,
+                representative_longitude=80.6,
+                description="New road issue"
+            )
+
+            self.assertEqual(mock_gen.call_count, 2, "generate_issue_reference_id must be called twice due to retry")
+            self.assertEqual(created.issue_reference_id, "ISSUE-2026-99992")
+
+            # Verify both issues exist in database
+            issues = self.db.query(PhysicalIssue).filter(PhysicalIssue.category == "Roads").all()
+            self.assertEqual(len(issues), 2)
+            self.assertEqual({i.issue_reference_id for i in issues}, {"ISSUE-2026-99991", "ISSUE-2026-99992"})
+
+    def test_30_non_integrity_error_does_not_retry_or_cause_second_insert(self):
+        """30. Non-IntegrityError during create/commit does not trigger a retry or second insert."""
+        from sqlalchemy.exc import OperationalError
+        from app.services.issue_service import PhysicalIssueService
+
+        service = PhysicalIssueService(self.db)
+
+        with patch("app.services.issue_service.generate_issue_reference_id", return_value="ISSUE-2026-FAIL01") as mock_gen:
+            with patch.object(self.db, "commit", side_effect=OperationalError("disk I/O error", params={}, orig=Exception("disk error"))) as mock_commit:
+                with self.assertRaises(OperationalError):
+                    service.create_issue(
+                        category="Roads",
+                        representative_latitude=16.5,
+                        representative_longitude=80.5,
+                        description="Should fail without retry"
+                    )
+
+                # Must not retry: exactly 1 attempt
+                self.assertEqual(mock_gen.call_count, 1)
+                self.assertEqual(mock_commit.call_count, 1)
+
+    def test_31_post_commit_refresh_failure_does_not_retry_create(self):
+        """31. An exception during db.refresh() after successful commit propagates without retrying create."""
+        from sqlalchemy.exc import OperationalError
+        from app.services.issue_service import PhysicalIssueService
+
+        service = PhysicalIssueService(self.db)
+
+        # Track commit calls and count created issues
+        orig_commit = self.db.commit
+        commit_calls = []
+        def tracking_commit():
+            commit_calls.append(True)
+            orig_commit()
+
+        with patch("app.services.issue_service.generate_issue_reference_id", return_value="ISSUE-2026-REFRESH-FAIL") as mock_gen:
+            with patch.object(self.db, "commit", side_effect=tracking_commit):
+                with patch.object(self.db, "refresh", side_effect=OperationalError("connection dropped during refresh", params={}, orig=Exception("dropped"))):
+                    with self.assertRaises(OperationalError):
+                        service.create_issue(
+                            category="Streetlights",
+                            representative_latitude=17.0,
+                            representative_longitude=78.0,
+                            description="Issue with post-commit refresh failure"
+                        )
+
+                    # ID generation and commit must be executed exactly ONCE
+                    self.assertEqual(mock_gen.call_count, 1, "Must NOT re-execute generate_issue_reference_id after commit")
+                    self.assertEqual(len(commit_calls), 1, "Must NOT re-execute commit after successful commit")
+
+        # The issue record was committed once and persisted
+        persisted = self.db.query(PhysicalIssue).filter(PhysicalIssue.issue_reference_id == "ISSUE-2026-REFRESH-FAIL").all()
+        self.assertEqual(len(persisted), 1, "Exactly one issue record must be persisted; no duplicate creation")
+
+    def test_32_unrelated_unique_constraint_violation_does_not_retry(self):
+        """32. Unrelated unique constraint violations (e.g. complaints.complaint_id) do NOT trigger a retry."""
+        from sqlalchemy.exc import IntegrityError
+        from app.services.issue_service import PhysicalIssueService
+
+        service = PhysicalIssueService(self.db)
+
+        # Part A: SQLite unrelated unique constraint (complaints.tracking_token)
+        sqlite_unrelated_err = IntegrityError(
+            "INSERT INTO complaints ...",
+            params={},
+            orig=Exception("UNIQUE constraint failed: complaints.tracking_token")
+        )
+        with patch("app.services.issue_service.generate_issue_reference_id", return_value="ISSUE-2026-UNRELATED-01") as mock_gen_a:
+            with patch.object(self.db, "commit", side_effect=sqlite_unrelated_err):
+                with self.assertRaises(IntegrityError):
+                    service.create_issue(category="Roads", representative_latitude=16.5, representative_longitude=80.5, description="Test")
+
+                self.assertEqual(mock_gen_a.call_count, 1, "Must fail immediately without retrying unrelated SQLite constraint")
+
+        # Part B: PostgreSQL driver diagnostic unrelated unique constraint (complaints_complaint_id_key)
+        mock_pg_diag = MagicMock(
+            constraint_name="complaints_complaint_id_key",
+            column_name="complaint_id",
+            message_detail="Key (complaint_id)=(JS-2026-00001) already exists."
+        )
+        mock_pg_orig = MagicMock(diag=mock_pg_diag)
+        pg_unrelated_err = IntegrityError(
+            "INSERT INTO complaints ...",
+            params={},
+            orig=mock_pg_orig
+        )
+        with patch("app.services.issue_service.generate_issue_reference_id", return_value="ISSUE-2026-UNRELATED-02") as mock_gen_b:
+            with patch.object(self.db, "commit", side_effect=pg_unrelated_err):
+                with self.assertRaises(IntegrityError):
+                    service.create_issue(category="Roads", representative_latitude=16.5, representative_longitude=80.5, description="Test")
+
+                self.assertEqual(mock_gen_b.call_count, 1, "Must fail immediately without retrying unrelated PostgreSQL constraint")
+
+    def test_33_is_issue_reference_id_collision_classification(self):
+        """33. Unit verification of is_issue_reference_id_collision classifier across engines."""
+        from sqlalchemy.exc import IntegrityError
+
+        # 1. Matching cases:
+        # SQLite matching
+        err_sqlite = IntegrityError("st", {}, orig=Exception("UNIQUE constraint failed: physical_issues.issue_reference_id"))
+        self.assertTrue(is_issue_reference_id_collision(err_sqlite))
+
+        # PostgreSQL matching via diag constraint_name on physical_issues
+        diag_match = MagicMock(table_name="physical_issues", constraint_name="physical_issues_issue_reference_id_key", column_name="issue_reference_id", message_detail="")
+        err_pg_diag = IntegrityError("st", {}, orig=MagicMock(diag=diag_match))
+        self.assertTrue(is_issue_reference_id_collision(err_pg_diag))
+
+        # PostgreSQL matching via BOTH table_name == 'physical_issues' AND column_name == 'issue_reference_id'
+        diag_col = MagicMock(table_name="physical_issues", constraint_name=None, column_name="issue_reference_id", message_detail="")
+        err_pg_col = IntegrityError("st", {}, orig=MagicMock(diag=diag_col))
+        self.assertTrue(is_issue_reference_id_collision(err_pg_col))
+
+        # PostgreSQL matching via table_name == 'physical_issues' and message_detail
+        diag_detail = MagicMock(table_name="physical_issues", constraint_name=None, column_name=None, message_detail="Key (issue_reference_id)=(ISSUE-2026-00001) already exists.")
+        err_pg_detail = IntegrityError("st", {}, orig=MagicMock(diag=diag_detail))
+        self.assertTrue(is_issue_reference_id_collision(err_pg_detail))
+
+        # 2. Non-matching (unrelated / ambiguous) cases:
+        # PostgreSQL unrelated table with unique column named 'issue_reference_id'
+        diag_unrelated_table = MagicMock(table_name="archived_issues", column_name="issue_reference_id", message_detail="Key (issue_reference_id)=(123) already exists.")
+        err_pg_unrelated_table = IntegrityError("st", {}, orig=MagicMock(diag=diag_unrelated_table))
+        self.assertFalse(is_issue_reference_id_collision(err_pg_unrelated_table), "Must reject unrelated table with column named issue_reference_id")
+
+        # PostgreSQL unrelated constraint name on different table
+        diag_other_table_constraint = MagicMock(table_name="audit_issues", constraint_name="audit_issues_issue_reference_id_key")
+        self.assertFalse(is_issue_reference_id_collision(IntegrityError("st", {}, orig=MagicMock(diag=diag_other_table_constraint))))
+
+        # PostgreSQL missing table_name and ambiguous column_name without known constraint
+        diag_ambiguous_col = MagicMock(table_name="", constraint_name="other_table_idx", column_name="issue_reference_id")
+        self.assertFalse(is_issue_reference_id_collision(IntegrityError("st", {}, orig=MagicMock(diag=diag_ambiguous_col))))
+
+        # Text fallback referencing another table
+        err_text_unrelated = IntegrityError('duplicate key value violates unique constraint "archived_issues_issue_reference_id_key" Key (issue_reference_id)=(123) already exists.', {}, None)
+        self.assertFalse(is_issue_reference_id_collision(err_text_unrelated))
+
+        # SQLite unrelated table
+        err_sqlite_other = IntegrityError("st", {}, orig=Exception("UNIQUE constraint failed: complaints.complaint_id"))
+        self.assertFalse(is_issue_reference_id_collision(err_sqlite_other))
+
+        # General non-IntegrityError
+        self.assertFalse(is_issue_reference_id_collision(ValueError("other error")))
+
+    def test_34_unrelated_table_unique_issue_reference_id_column_does_not_retry(self):
+        """34. An unrelated table with a unique issue_reference_id column returns False and does NOT trigger retry."""
+        from sqlalchemy.exc import IntegrityError
+        from app.services.issue_service import PhysicalIssueService
+
+        service = PhysicalIssueService(self.db)
+
+        # Unrelated table 'archived_issues' has a unique column 'issue_reference_id'
+        mock_pg_diag = MagicMock(
+            table_name="archived_issues",
+            column_name="issue_reference_id",
+            constraint_name="archived_issues_issue_reference_id_key",
+            message_detail="Key (issue_reference_id)=(ARCH-01) already exists."
+        )
+        mock_pg_orig = MagicMock(diag=mock_pg_diag)
+        unrelated_table_err = IntegrityError(
+            "INSERT INTO archived_issues (issue_reference_id) VALUES ('ARCH-01')",
+            params={},
+            orig=mock_pg_orig
+        )
+
+        with patch("app.services.issue_service.generate_issue_reference_id", return_value="ISSUE-2026-UNRELATED-TABLE") as mock_gen:
+            with patch.object(self.db, "commit", side_effect=unrelated_table_err):
+                with self.assertRaises(IntegrityError):
+                    service.create_issue(
+                        category="Roads",
+                        representative_latitude=16.5,
+                        representative_longitude=80.5,
+                        description="Should fail without retry on unrelated table"
+                    )
+
+                # Must fail immediately: exactly 1 attempt, zero retries
+                self.assertEqual(mock_gen.call_count, 1, "Must NOT retry when unique collision occurs on an unrelated table")
+
+    def test_35_provisional_anchor_and_audit_event_atomicity(self):
+        """35. Provisional anchor, complaint association, and audit event persist atomically in a single transaction."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue, ComplaintEvent
+
+        complaint = self._create_test_complaint(
+            citizen_id="citizen-atomic-1",
+            category="Roads",
+            lat=16.7100,
+            lon=80.7100,
+            desc="Pothole needing atomic anchor creation"
+        )
+        self.assertIsNone(complaint.issue_id)
+
+        # Successful atomic creation
+        anchor = DuplicateDetector._create_provisional_anchor(complaint, self.db)
+        self.assertIsNotNone(anchor)
+        self.assertEqual(complaint.issue_id, anchor.issue_reference_id)
+
+        # Verify physical issue and audit event exist
+        persisted_anchor = self.db.query(PhysicalIssue).filter_by(issue_reference_id=anchor.issue_reference_id).first()
+        self.assertIsNotNone(persisted_anchor)
+
+        event = self.db.query(ComplaintEvent).filter_by(
+            complaint_id=complaint.complaint_id,
+            event_type="provisional_issue_anchor_created"
+        ).first()
+        self.assertIsNotNone(event)
+        self.assertEqual(event.new_value, anchor.issue_reference_id)
+
+        # Now test atomicity rollback when commit fails
+        complaint_fail = self._create_test_complaint(
+            citizen_id="citizen-atomic-2",
+            category="Sanitation",
+            lat=16.7200,
+            lon=80.7200,
+            desc="Garbage dump with simulated commit failure"
+        )
+        with patch.object(self.db, "commit", side_effect=RuntimeError("Simulated DB connection drop on commit")):
+            with self.assertRaises(RuntimeError):
+                DuplicateDetector._create_provisional_anchor(complaint_fail, self.db)
+
+        # After rollback, verify no orphan anchor or audit event was persisted
+        failed_event = self.db.query(ComplaintEvent).filter_by(
+            complaint_id=complaint_fail.complaint_id,
+            event_type="provisional_issue_anchor_created"
+        ).first()
+        self.assertIsNone(failed_event, "No audit event should persist after failed transaction commit")
+
+    def test_36_unrelated_integrity_error_not_swallowed_when_anchor_exists(self):
+        """36. An unrelated IntegrityError is never swallowed or suppressed even if an anchor exists."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from sqlalchemy.exc import IntegrityError
+
+        complaint = self._create_test_complaint(
+            citizen_id="citizen-err-1",
+            category="Water Supply",
+            lat=16.8000,
+            lon=80.8000,
+            desc="Water pipeline issue"
+        )
+
+        unrelated_err = IntegrityError(
+            "FOREIGN KEY constraint failed: complaints.user_id",
+            params={},
+            orig=Exception("FOREIGN KEY constraint failed: complaints.user_id")
+        )
+
+        with patch("app.services.issue_id_service.generate_issue_reference_id", return_value="ISSUE-2026-UNRELATED-ERR") as mock_gen:
+            with patch.object(self.db, "commit", side_effect=unrelated_err):
+                with self.assertRaises(IntegrityError):
+                    DuplicateDetector._create_provisional_anchor(complaint, self.db)
+
+                # Must not loop / retry on unrelated integrity errors
+                self.assertEqual(mock_gen.call_count, 1)
+
+    def test_37_anchor_post_commit_refresh_failure_does_not_retry_or_duplicate(self):
+        """37. Post-commit db.refresh failure outside retry handler does not retry or create duplicate anchors."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue
+
+        complaint = self._create_test_complaint(
+            citizen_id="citizen-refresh-1",
+            category="Electricity",
+            lat=16.8500,
+            lon=80.8500,
+            desc="Flickering street light"
+        )
+
+        with patch("app.services.issue_id_service.generate_issue_reference_id", return_value="ISSUE-2026-REFRESH-TEST") as mock_gen:
+            with patch.object(self.db, "refresh", side_effect=RuntimeError("Post-commit refresh failed")):
+                with self.assertRaises(RuntimeError):
+                    DuplicateDetector._create_provisional_anchor(complaint, self.db)
+
+                # Exactly 1 ID generation and anchor insertion attempt occurred (no retries)
+                self.assertEqual(mock_gen.call_count, 1)
+
+        # The anchor was committed in the DB before refresh failed
+        persisted = self.db.query(PhysicalIssue).filter_by(issue_reference_id="ISSUE-2026-REFRESH-TEST").first()
+        self.assertIsNotNone(persisted, "The anchor should remain committed even if post-commit refresh failed")
+
+    def test_38_concurrent_same_location_anchor_creation_resolves_to_single_anchor(self):
+        """38. Same-location concurrent anchor collision links to winning anchor with linked audit event."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue, ComplaintEvent
+        from sqlalchemy.exc import IntegrityError
+
+        complaint = self._create_test_complaint(
+            citizen_id="citizen-race-1",
+            category="Roads",
+            lat=16.9000,
+            lon=80.9000,
+            desc="Concurrent road pothole"
+        )
+
+        collision_err = IntegrityError(
+            "UNIQUE constraint failed: physical_issues.issue_reference_id",
+            params={},
+            orig=Exception("UNIQUE constraint failed: physical_issues.issue_reference_id")
+        )
+
+        attempt_count = 0
+        real_commit = self.db.commit
+        def side_effect_commit():
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                # Another concurrent thread commits winning anchor at same location before our transaction finishes
+                from sqlalchemy.orm import sessionmaker
+                concurrent_session_factory = sessionmaker(bind=test_engine)
+                concurrent_db = concurrent_session_factory()
+                try:
+                    winning_anchor = PhysicalIssue(
+                        issue_reference_id="ISSUE-2026-WINNING",
+                        category="Roads",
+                        representative_latitude=16.9000,
+                        representative_longitude=80.9000,
+                        representative_location="Winning Anchor Location",
+                        description="[Provisional Issue Anchor] Winning anchor",
+                        current_status="Open",
+                        created_at=utc_now(),
+                        updated_at=utc_now(),
+                    )
+                    concurrent_db.add(winning_anchor)
+                    concurrent_db.commit()
+                finally:
+                    concurrent_db.close()
+                raise collision_err
+            else:
+                return real_commit()
+
+        # Simulate collision on first commit attempt, then recovery linking to winning anchor
+        with patch.object(self.db, "commit", side_effect=side_effect_commit):
+            anchor = DuplicateDetector._create_provisional_anchor(complaint, self.db)
+            self.assertEqual(anchor.issue_reference_id, "ISSUE-2026-WINNING")
+            self.db.refresh(complaint)
+            self.assertEqual(complaint.issue_id, "ISSUE-2026-WINNING")
+
+            # Verify provisional_issue_anchor_linked audit event was created
+            link_event = self.db.query(ComplaintEvent).filter_by(
+                complaint_id=complaint.complaint_id,
+                event_type="provisional_issue_anchor_linked"
+            ).first()
+            self.assertIsNotNone(link_event)
+            self.assertEqual(link_event.new_value, "ISSUE-2026-WINNING")
+
+    def test_39_id_generation_failure_triggers_rollback_and_propagates_exception(self):
+        """39. Database failure during ID generation rolls back the session and propagates original exception."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue, ComplaintEvent
+
+        complaint = self._create_test_complaint(
+            citizen_id="citizen-id-fail-1",
+            category="Sanitation",
+            lat=16.9500,
+            lon=80.9500,
+            desc="Garbage piling up near school"
+        )
+
+        with patch("app.services.issue_id_service.generate_issue_reference_id", side_effect=RuntimeError("Simulated DB sequence lock timeout")):
+            with patch.object(self.db, "rollback", wraps=self.db.rollback) as mock_rollback:
+                with self.assertRaises(RuntimeError) as cm:
+                    DuplicateDetector._create_provisional_anchor(complaint, self.db)
+
+                self.assertIn("Simulated DB sequence lock timeout", str(cm.exception))
+                # Verify rollback was called to ensure active transaction and spatial lock do not leak
+                self.assertGreaterEqual(mock_rollback.call_count, 1)
+
+        # Confirm no physical issue or audit event was persisted
+        persisted_anchor = self.db.query(PhysicalIssue).filter_by(category="Sanitation").first()
+        self.assertIsNone(persisted_anchor)
+
+        event = self.db.query(ComplaintEvent).filter_by(
+            complaint_id=complaint.complaint_id,
+            event_type="provisional_issue_anchor_created"
+        ).first()
+        self.assertIsNone(event)
+
+    def test_40_initial_existing_anchor_lookup_failure_triggers_rollback_and_propagates_exception(self):
+        """40. Database failure during initial existing-anchor lookup triggers rollback and propagates exception."""
+        from app.services.duplicate_detection.duplicate_detector import DuplicateDetector
+        from app.models.complaint import PhysicalIssue
+
+        complaint = self._create_test_complaint(
+            citizen_id="citizen-lookup-fail-1",
+            category="Roads",
+            lat=16.6500,
+            lon=80.6500,
+            desc="Pothole lookup failure test"
+        )
+
+        real_query = self.db.query
+
+        def side_effect_query(entity, *args, **kwargs):
+            if entity is PhysicalIssue:
+                raise RuntimeError("Simulated DB query timeout during initial existing-anchor lookup")
+            return real_query(entity, *args, **kwargs)
+
+        with patch.object(self.db, "query", side_effect=side_effect_query):
+            with patch.object(self.db, "rollback", wraps=self.db.rollback) as mock_rollback:
+                with self.assertRaises(RuntimeError) as cm:
+                    DuplicateDetector._create_provisional_anchor(complaint, self.db)
+
+                self.assertIn("Simulated DB query timeout during initial existing-anchor lookup", str(cm.exception))
+                self.assertGreaterEqual(mock_rollback.call_count, 1, "Must call db.rollback() on initial lookup failure")
+
 
 if __name__ == "__main__":
     unittest.main()

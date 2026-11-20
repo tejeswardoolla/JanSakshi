@@ -19,8 +19,8 @@ from app.services.duplicate_detection.candidate_retrieval import retrieve_candid
 
 logger = logging.getLogger("jansakshi.duplicate_detection")
 
-# Application-level mutex to serialize anchor creation across concurrent worker threads
-_anchor_creation_lock = threading.Lock()
+# Application-level re-entrant mutex to serialize anchor creation across concurrent worker threads
+_anchor_creation_lock = threading.RLock()
 
 class DuplicateDetector:
     """
@@ -38,6 +38,10 @@ class DuplicateDetector:
         """
         lat_tol = 0.0001
         lon_tol = 0.0001
+        target_lat = complaint.latitude
+        target_lon = complaint.longitude
+        target_category = complaint.category
+        complaint_id = complaint.complaint_id
 
         with _anchor_creation_lock:
             if complaint.issue_id:
@@ -46,12 +50,14 @@ class DuplicateDetector:
                     return existing
 
             # Distributed advisory transaction lock for PostgreSQL / Neon
-            dialect_name = ""
-            try:
-                bind = db.get_bind() if hasattr(db, "get_bind") else db.bind
-                dialect_name = (getattr(bind, "dialect", None).name or "").lower()
-            except Exception:
-                pass
+            from app.services.issue_id_service import (
+                generate_issue_reference_id,
+                get_verified_database_dialect,
+                _issue_id_seq_mutex,
+                is_issue_reference_id_collision,
+            )
+
+            dialect_name = get_verified_database_dialect(db)
 
             if dialect_name == "postgresql" and complaint.latitude is not None and complaint.longitude is not None:
                 lock_key = f"jansakshi_anchor_{complaint.category}_{complaint.latitude:.4f}_{complaint.longitude:.4f}"
@@ -68,21 +74,23 @@ class DuplicateDetector:
 
             # Check if an anchor already exists at the coordinates and category
             if complaint.latitude is not None and complaint.longitude is not None:
-                existing_exact = db.query(PhysicalIssue).filter(
-                    PhysicalIssue.category == complaint.category,
-                    PhysicalIssue.representative_latitude >= complaint.latitude - lat_tol,
-                    PhysicalIssue.representative_latitude <= complaint.latitude + lat_tol,
-                    PhysicalIssue.representative_longitude >= complaint.longitude - lon_tol,
-                    PhysicalIssue.representative_longitude <= complaint.longitude + lon_tol,
-                ).first()
-                if existing_exact:
-                    complaint.issue_id = existing_exact.issue_reference_id
-                    complaint.updated_at = utc_now()
-                    db.commit()
-                    return existing_exact
-
-            from app.services.issue_id_service import generate_issue_reference_id
-            issue_ref = generate_issue_reference_id(db)
+                try:
+                    existing_exact = db.query(PhysicalIssue).filter(
+                        PhysicalIssue.category == complaint.category,
+                        PhysicalIssue.representative_latitude >= complaint.latitude - lat_tol,
+                        PhysicalIssue.representative_latitude <= complaint.latitude + lat_tol,
+                        PhysicalIssue.representative_longitude >= complaint.longitude - lon_tol,
+                        PhysicalIssue.representative_longitude <= complaint.longitude + lon_tol,
+                    ).first()
+                    if existing_exact:
+                        target_complaint = db.query(Complaint).filter(Complaint.complaint_id == complaint_id).first() or complaint
+                        target_complaint.issue_id = existing_exact.issue_reference_id
+                        target_complaint.updated_at = utc_now()
+                        db.commit()
+                        return existing_exact
+                except Exception:
+                    db.rollback()
+                    raise
 
             rep_location = (
                 complaint.google_maps_url
@@ -94,57 +102,85 @@ class DuplicateDetector:
                 )
             )
 
-            # Clearly identify as a provisional anchor; does not trigger automated municipal dispatch
-            anchor = PhysicalIssue(
-                issue_reference_id=issue_ref,
-                category=complaint.category,
-                representative_latitude=complaint.latitude if complaint.latitude is not None else 0.0,
-                representative_longitude=complaint.longitude if complaint.longitude is not None else 0.0,
-                representative_location=f"Provisional Cluster ({rep_location})",
-                description=f"[Provisional Issue Anchor] {complaint.description}",
-                current_status="Open",
-                created_at=utc_now(),
-                updated_at=utc_now(),
-            )
+            max_anchor_attempts = 3
+            with _issue_id_seq_mutex:
+                for attempt in range(max_anchor_attempts):
+                    try:
+                        issue_ref = generate_issue_reference_id(db)
 
-            try:
-                db.add(anchor)
-                db.commit()
-                db.refresh(anchor)
+                        # Clearly identify as a provisional anchor; does not trigger automated municipal dispatch
+                        anchor = PhysicalIssue(
+                            issue_reference_id=issue_ref,
+                            category=complaint.category,
+                            representative_latitude=complaint.latitude if complaint.latitude is not None else 0.0,
+                            representative_longitude=complaint.longitude if complaint.longitude is not None else 0.0,
+                            representative_location=f"Provisional Cluster ({rep_location})",
+                            description=f"[Provisional Issue Anchor] {complaint.description}",
+                            current_status="Open",
+                            created_at=utc_now(),
+                            updated_at=utc_now(),
+                        )
 
-                complaint.issue_id = issue_ref
-                complaint.updated_at = utc_now()
+                        target_complaint = db.query(Complaint).filter(Complaint.complaint_id == complaint_id).first() or complaint
+                        db.add(anchor)
+                        target_complaint.issue_id = issue_ref
+                        target_complaint.updated_at = utc_now()
 
-                event = ComplaintEvent(
-                    complaint_id=complaint.complaint_id,
-                    event_type="provisional_issue_anchor_created",
-                    previous_value=None,
-                    new_value=issue_ref,
-                    description=f"Provisional Physical Issue anchor {issue_ref} established for geolocated complaint.",
-                    source="ai_duplicate_detector",
-                    created_at=utc_now(),
-                )
-                db.add(event)
-                db.commit()
-                return anchor
-
-            except IntegrityError:
-                # Concurrent transaction inserted with the same ID or location; rollback and reload winning anchor
-                db.rollback()
-                if complaint.latitude is not None and complaint.longitude is not None:
-                    existing_exact = db.query(PhysicalIssue).filter(
-                        PhysicalIssue.category == complaint.category,
-                        PhysicalIssue.representative_latitude >= complaint.latitude - lat_tol,
-                        PhysicalIssue.representative_latitude <= complaint.latitude + lat_tol,
-                        PhysicalIssue.representative_longitude >= complaint.longitude - lon_tol,
-                        PhysicalIssue.representative_longitude <= complaint.longitude + lon_tol,
-                    ).first()
-                    if existing_exact:
-                        complaint.issue_id = existing_exact.issue_reference_id
-                        complaint.updated_at = utc_now()
+                        event = ComplaintEvent(
+                            complaint_id=complaint_id,
+                            event_type="provisional_issue_anchor_created",
+                            previous_value=None,
+                            new_value=issue_ref,
+                            description=f"Provisional Physical Issue anchor {issue_ref} established for geolocated complaint.",
+                            source="ai_duplicate_detector",
+                            created_at=utc_now(),
+                        )
+                        db.add(event)
                         db.commit()
-                        return existing_exact
-                raise
+
+                    except IntegrityError as err:
+                        db.rollback()
+                        if not is_issue_reference_id_collision(err):
+                            raise
+
+                        if target_lat is not None and target_lon is not None:
+                            existing_exact = db.query(PhysicalIssue).filter(
+                                PhysicalIssue.category == target_category,
+                                PhysicalIssue.representative_latitude >= target_lat - lat_tol,
+                                PhysicalIssue.representative_latitude <= target_lat + lat_tol,
+                                PhysicalIssue.representative_longitude >= target_lon - lon_tol,
+                                PhysicalIssue.representative_longitude <= target_lon + lon_tol,
+                            ).first()
+                            if existing_exact:
+                                target_complaint = db.query(Complaint).filter(Complaint.complaint_id == complaint_id).first() or complaint
+                                target_complaint.issue_id = existing_exact.issue_reference_id
+                                target_complaint.updated_at = utc_now()
+                                link_event = ComplaintEvent(
+                                    complaint_id=complaint_id,
+                                    event_type="provisional_issue_anchor_linked",
+                                    previous_value=None,
+                                    new_value=existing_exact.issue_reference_id,
+                                    description=(
+                                        f"Associated complaint with existing provisional Physical Issue anchor "
+                                        f"{existing_exact.issue_reference_id} after concurrency resolution."
+                                    ),
+                                    source="ai_duplicate_detector",
+                                    created_at=utc_now(),
+                                )
+                                db.add(link_event)
+                                db.commit()
+                                return existing_exact
+
+                        if attempt < max_anchor_attempts - 1:
+                            continue
+                        raise
+
+                    except Exception:
+                        db.rollback()
+                        raise
+
+                    db.refresh(anchor)
+                    return anchor
 
     @classmethod
     def evaluate_complaint(
