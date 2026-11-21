@@ -565,5 +565,72 @@ class TestJudgeDemoAccess(unittest.TestCase):
             self.assertEqual(ctx.exception.status_code, 429)
             self.assertIn("Rate limit exceeded", ctx.exception.detail)
 
+    # -------------------------------------------------------------------------
+    # 14. Judge login read-only enforcement and production database isolation
+    # -------------------------------------------------------------------------
+    def test_14_judge_login_read_only_and_production_isolation(self):
+        """
+        Verify that:
+        1. Judge login never creates users or departments (strictly read-only).
+        2. Judge login against a production database is rejected even if demo-enabled flag is true.
+        3. Missing pre-seeded judge account returns a safe error (HTTP 404).
+        4. Dedicated demo database login works with pre-seeded accounts.
+        5. Production database remains permanently blocked with force flag on seeder.
+        6. Existing normal password login remains completely functional.
+        """
+        future_expiry = (utc_now() + datetime.timedelta(days=10)).isoformat()
+        req = self._create_mock_request(ip="127.0.0.1")
+
+        with patch.dict(os.environ, {
+            "JANSAKSHI_JUDGE_DEMO_ENABLED": "true",
+            "JANSAKSHI_JUDGE_DEMO_EXPIRES_AT": future_expiry
+        }):
+            # 1. Judge login against a production database is rejected with HTTP 403
+            prod_url = "postgresql://neondb_owner:secret@ep-cool-snowflake-12345.us-east-2.aws.neon.tech/neondb"
+            prod_sess = self._create_mock_session_with_url(prod_url)
+            with self.assertRaises(HTTPException) as ctx_prod:
+                asyncio.run(judge_demo_login("admin", req, prod_sess))
+            self.assertEqual(ctx_prod.exception.status_code, 403)
+            self.assertIn("restricted to the dedicated demo environment", ctx_prod.exception.detail)
+            # Zero writes to production
+            self.assertEqual(prod_sess.add.call_count, 0)
+            self.assertEqual(prod_sess.commit.call_count, 0)
+
+            # 2. Missing pre-seeded judge account returns safe HTTP 404 and NEVER creates users/departments
+            user_count_before = self.db.query(User).count()
+            dept_count_before = self.db.query(Department).count()
+
+            with patch("app.routes.auth_routes.get_judge_demo_account", return_value=None):
+                with self.assertRaises(HTTPException) as ctx_missing:
+                    asyncio.run(judge_demo_login("admin", req, self.db))
+                self.assertEqual(ctx_missing.exception.status_code, 404)
+                self.assertIn("has not been provisioned", ctx_missing.exception.detail)
+
+            # Assert database was NOT mutated
+            user_count_after = self.db.query(User).count()
+            dept_count_after = self.db.query(Department).count()
+            self.assertEqual(user_count_after, user_count_before)
+            self.assertEqual(dept_count_after, dept_count_before)
+
+            # 3. Dedicated demo database login works with pre-seeded accounts
+            res_demo = asyncio.run(judge_demo_login("admin", req, self.db))
+            self.assertIsNotNone(res_demo.access_token)
+            self.assertEqual(res_demo.user.username, "judge_admin")
+
+            # 4. Production database seeder remains permanently blocked with force flag
+            with self.assertRaises(PermissionError) as ctx_seed:
+                seed_judge_demo_data(prod_sess, force_allow=True)
+            self.assertIn("FAIL-CLOSED PRODUCTION PROTECTION", str(ctx_seed.exception))
+            self.assertEqual(prod_sess.add.call_count, 0)
+            self.assertEqual(prod_sess.commit.call_count, 0)
+
+            # 5. Normal password login remains unchanged
+            normal_login_res = asyncio.run(login(
+                credentials=LoginRequest(username="admin_test", password="SecretPass@admin123!"),
+                db=self.db
+            ))
+            self.assertIsNotNone(normal_login_res.access_token)
+            self.assertEqual(normal_login_res.user.username, "admin_test")
+
 if __name__ == "__main__":
     unittest.main()

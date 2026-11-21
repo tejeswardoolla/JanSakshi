@@ -29,7 +29,7 @@ from app.core.security import (
     IS_DEMO_POLICY
 )
 from app.core.config import utc_now, get_judge_demo_expiry, is_judge_demo_active
-from app.services.judge_demo_service import ensure_judge_demo_accounts
+from app.services.judge_demo_service import get_judge_demo_account, classify_database_target
 
 logger = logging.getLogger("jansakshi.auth")
 
@@ -396,7 +396,19 @@ async def judge_demo_login(
             detail="Judge demo expiry is not configured or invalid."
         )
 
-    # 3. Rate limiting (max 15 requests per minute per IP)
+    # 3. Verify connected database is strictly an authorized dedicated demo database
+    db_target = classify_database_target(db)
+    if db_target != "DEMO":
+        logger.critical(
+            "Judge demo login rejected: connected database is not an approved demo database (%s), client_ip=%s",
+            db_target, client_ip
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Judge demo access is restricted to the dedicated demo environment."
+        )
+
+    # 4. Rate limiting (max 15 requests per minute per IP)
     if not _check_demo_rate_limit(client_ip):
         logger.warning("Judge demo login rate limit exceeded for IP %s", client_ip)
         raise HTTPException(
@@ -404,18 +416,17 @@ async def judge_demo_login(
             detail="Rate limit exceeded for judge demo access. Please try again shortly."
         )
 
-    # 4. Resolve dedicated demo user account
-    demo_users = ensure_judge_demo_accounts(db)
-    user = demo_users.get(normalized_role)
+    # 5. Retrieve already-provisioned judge demo user account (STRICTLY READ-ONLY)
+    user = get_judge_demo_account(db, normalized_role)
     if not user or not user.is_active:
-        logger.error("Dedicated judge demo account for role '%s' could not be resolved", normalized_role)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Judge demo account resolution failed."
+        logger.warning(
+            "Judge demo login rejected: account for role '%s' has not been pre-seeded or is inactive",
+            normalized_role
         )
-
-    user.last_login_at = utc_now()
-    db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Judge demo account has not been provisioned. Please contact the administrator."
+        )
 
     dept_name = user.department.name if user.department else None
     dept_code = user.department.code if user.department else None

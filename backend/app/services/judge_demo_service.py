@@ -42,15 +42,21 @@ APPROVED_DEMO_HOSTS = {
 }
 
 def _get_production_hosts() -> set:
-    """Returns the comprehensive set of denylisted production database hostnames."""
+    """
+    Returns the comprehensive set of denylisted production database hostnames.
+    Uses an explicit production hostname configuration and known production database identity.
+    Does not automatically classify current DATABASE_URL as production merely because APP_ENV=production,
+    as the dedicated demo deployment also runs with APP_ENV=production.
+    """
     hosts = set(PROD_DATABASE_HOSTS)
     custom_prod_host = os.getenv("PRODUCTION_DATABASE_HOST", "").strip().lower()
     if custom_prod_host:
         hosts.add(custom_prod_host)
-    if APP_ENV == "production" and DATABASE_URL:
+    custom_prod_url = os.getenv("PRODUCTION_DATABASE_URL", "").strip()
+    if custom_prod_url:
         import urllib.parse
         try:
-            p = urllib.parse.urlparse(DATABASE_URL)
+            p = urllib.parse.urlparse(custom_prod_url)
             if p.hostname:
                 hosts.add(p.hostname.lower())
         except Exception:
@@ -503,11 +509,32 @@ def ensure_departments(db: Session) -> None:
             existing.is_active = True
     db.commit()
 
+def get_judge_demo_account(db: Session, role: str) -> Optional[User]:
+    """
+    Read-only retrieval of an already-provisioned dedicated judge demo account.
+    Never creates, updates, seeds, or mutates database records.
+    Returns None if the account has not been provisioned.
+    """
+    normalized_role = role.strip().lower()
+    spec = DEMO_ACCOUNTS_SPEC.get(normalized_role)
+    if not spec:
+        return None
+    return db.query(User).filter(
+        User.username == spec["username"],
+        User.role == spec["role"]
+    ).first()
+
 def ensure_judge_demo_accounts(db: Session) -> Dict[str, User]:
     """
     Idempotently creates or updates the dedicated judge demo accounts for the 3 allowed roles.
     Uses cryptographically random, non-public passwords with standard bcrypt hashing.
+    Used ONLY during explicit database seeding, NEVER during auth login requests.
     """
+    if classify_database_target(db) == "PRODUCTION":
+        raise PermissionError(
+            "FAIL-CLOSED PRODUCTION PROTECTION: Provisioning judge demo accounts against "
+            "the production database is strictly prohibited."
+        )
     ensure_departments(db)
     demo_users: Dict[str, User] = {}
 
