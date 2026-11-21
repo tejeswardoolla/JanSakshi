@@ -10,7 +10,7 @@ export default function AuthorityHeader() {
 
   const handleLogout = () => {
     logout()
-    navigate('/authority/login')
+    navigate('/authority/login?quick_access=true')
   }
 
   const navItems = [
