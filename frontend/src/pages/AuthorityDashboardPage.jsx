@@ -29,7 +29,7 @@ export default function AuthorityDashboardPage() {
 
   useEffect(() => {
     if (!isAuthenticated) {
-      navigate('/authority/login')
+      navigate('/authority/login?quick_access=true')
       return
     }
 
