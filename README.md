@@ -4,7 +4,7 @@
   <img src="frontend/public/assets/jansakshi-logo.jpg" width="140" alt="JanSakshi Logo" style="border-radius: 20px; box-shadow: 0 8px 24px rgba(0,0,0,0.15);" />
 
   ### AI-Powered Civic Grievance Verification & Municipal Accountability Platform
-  **Citizen Reports. Multimodal AI Verifies. Cryptographic Accountability Delivers.**
+  **Citizen Reports. Multimodal AI Verifies. Traceable Workflows Deliver Accountability.**
 
   [![FastAPI](https://img.shields.io/badge/Backend-FastAPI%20%7C%20Python%203.12-009688.svg?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com/)
   [![React](https://img.shields.io/badge/Frontend-React%2019%20%7C%20Vite%208-61DAFB.svg?style=flat-square&logo=react)](https://react.dev/)
@@ -64,7 +64,7 @@ Urban Local Bodies (ULBs) across India manage thousands of citizen grievances we
 | **4** | **Visual Verification** | Static image upload without analysis | **Gemini Multimodal Vision** evaluating evidence relevance, visibility, blur, and severity |
 | **5** | **Field Accountability** | Unverified status dropdown update | **Multi-version resolution submissions** (`v1`, `v2`) with before/after photo comparison and sign-off review |
 | **6** | **Session Security** | Permanent passwords or long-lived static tokens | **Short-lived access tokens (30 min)** backed by cryptographic single-use rotating refresh tokens and JTI revocation |
-| **7** | **Traceability** | Black-box state changes | **Immutable audit event logs** tracking every transition from intake to inspection, work order, and approval |
+| **7** | **Traceability** | Black-box state changes | **Chronological audit event history** tracking transitions from intake to inspection, work order, and approval |
 
 ---
 
@@ -252,7 +252,7 @@ To protect municipal servers from email spam and newsletter dumps, every email p
 4. **Layer 4 — Human Review Desk Routing:** Ambiguous scores ($0.45 - 0.70$) are routed to the *Gmail Desk* queue in the Admin dashboard, preventing false drops.
 
 ### Idempotency and Concurrency Safeguards
-- **`gmail_message_id` Enforcement:** The database applies a unique constraint on `email_messages.gmail_message_id`. Even under rapid polling or retries, an email is processed exactly once.
+- **`gmail_message_id` Enforcement:** The database applies a unique constraint on `email_messages.gmail_message_id`. The unique message ID prevents duplicate email records for the same Gmail message; the processor checks existing records before retrying or continuing processing.
 - **PostgreSQL Advisory Locks:** `GmailSyncLock` acquires a dedicated session-level lock (`ADVISORY_LOCK_ID = 987654321`) ensuring multiple background workers never poll or process the inbox concurrently.
 
 ### Gemini Extraction and Citizen Acknowledgment
