@@ -16,7 +16,7 @@ export default function AuthorityLayout({ children, pageTitle, breadcrumbs = [] 
 
   // Enforce access control
   if (!loading && !isAuthenticated) {
-    return <Navigate to="/authority/login" replace state={{ from: location }} />
+    return <Navigate to="/authority/login?quick_access=true" replace state={{ from: location }} />
   }
 
   const handleLogout = () => {
