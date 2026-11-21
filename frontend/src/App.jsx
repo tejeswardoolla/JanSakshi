@@ -35,7 +35,7 @@ export default function App() {
             <Route path="/email-management" element={<Navigate to="/authority/email-management" replace />} />
 
             {/* Dedicated Authority & Department Portal */}
-            <Route path="/login" element={<Navigate to="/authority/login" replace />} />
+            <Route path="/login" element={<Navigate to="/authority/login?quick_access=true" replace />} />
             <Route path="/authority/login" element={<AuthorityLoginPage />} />
             <Route path="/authority/select-department" element={<DepartmentSelectionPage />} />
             <Route path="/authority" element={<AuthorityDashboardPage />} />
