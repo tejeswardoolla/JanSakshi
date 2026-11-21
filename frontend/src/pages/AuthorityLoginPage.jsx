@@ -10,11 +10,13 @@ import { useAuth } from '../context/AuthContext'
 export default function AuthorityLoginPage() {
   const [searchParams] = useSearchParams()
   const sessionExpired = searchParams.get('session_expired') === 'true'
+  const quickAccessParam = searchParams.get('quick_access') === 'true' || searchParams.get('quick-access') === 'true'
+  const quickAccessEnabled = (import.meta.env.VITE_QUICK_LOGIN_ENABLED === 'true' || import.meta.env.DEV) && quickAccessParam
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState(null)
-  const [demoExpanded, setDemoExpanded] = useState(false)
+  const [demoExpanded, setDemoExpanded] = useState(true)
   const { login, loading } = useAuth()
   const navigate = useNavigate()
 
@@ -44,12 +46,14 @@ export default function AuthorityLoginPage() {
   const fillCredentials = (accountType) => {
     if (accountType === 'admin') {
       setUsername('admin')
+      setPassword(import.meta.env.VITE_QUICK_LOGIN_ADMIN_PASSWORD || '')
     } else if (accountType === 'officer') {
       setUsername('officer')
+      setPassword(import.meta.env.VITE_QUICK_LOGIN_OFFICER_PASSWORD || '')
     } else if (accountType === 'dept_demo') {
       setUsername('dept_demo')
+      setPassword(import.meta.env.VITE_QUICK_LOGIN_DEPT_PASSWORD || '')
     }
-    setPassword('')
     setError(null)
   }
 
@@ -264,8 +268,8 @@ export default function AuthorityLoginPage() {
               </button>
             </form>
 
-            {/* Collapsible Hackathon Demo Access (Development Mode Only) */}
-            {import.meta.env.DEV && (
+            {/* Collapsible Quick Access Panel (Query Parameter + Feature Flag Guarded) */}
+            {quickAccessEnabled && (
               <div className="pt-4 border-t border-white/[0.08]">
                 <button
                   type="button"
