@@ -21,7 +21,7 @@ export default function AuthorityLayout({ children, pageTitle, breadcrumbs = [] 
 
   const handleLogout = () => {
     logout()
-    navigate('/authority/login')
+    navigate('/authority/login?quick_access=true')
   }
 
   // Strict role-specific navigation definitions
