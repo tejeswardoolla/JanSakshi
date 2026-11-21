@@ -18,29 +18,134 @@ from app.core.config import utc_now, APP_ENV, DATABASE_URL
 
 logger = logging.getLogger("jansakshi.judge_demo")
 
+def classify_database_target(db: Session) -> str:
+    """
+    Inspects the actual connection and bind details directly from the database Session.
+    Does not rely only on imported environment variables.
+    Classifies the database target into one of three strict categories:
+    - 'PRODUCTION': The real JanSakshi production database (neondb / production host).
+    - 'DEMO': An explicitly authorized dedicated demo database.
+    - 'UNKNOWN': Any unrecognized, external, or staging database.
+    """
+    bind = getattr(db, "get_bind", lambda: None)()
+    if bind is None:
+        return "UNKNOWN"
+
+    url = getattr(bind, "url", None)
+    if not url:
+        return "UNKNOWN"
+
+    driver = (url.drivername or "").lower()
+    raw_database = (url.database or "").lower()
+    host = (url.host or "").lower()
+
+    # If connected to a live PostgreSQL database, also verify current_database()
+    actual_database = raw_database
+    dialect = getattr(bind, "dialect", None)
+    if dialect and getattr(dialect, "name", "") == "postgresql":
+        try:
+            from sqlalchemy import text
+            live_db = db.execute(text("SELECT current_database()")).scalar()
+            if live_db and isinstance(live_db, str):
+                actual_database = live_db.strip().lower()
+        except Exception:
+            pass
+
+    # Extract base filename if SQLite path (e.g. /path/to/jansakshi.db -> jansakshi.db)
+    clean_db_name = os.path.basename(actual_database) if "sqlite" in driver else actual_database
+
+    # 1. STRICT PRODUCTION CHECK (Never allowed under any circumstance)
+    # The canonical production database for JanSakshi on Neon is 'neondb'
+    is_prod_name = (clean_db_name == "neondb")
+    is_neon_host = "neon.tech" in host
+    is_prod_cluster = is_neon_host and ("demo" not in host and "test" not in host)
+
+    if is_prod_name or (is_prod_cluster and "demo" not in clean_db_name):
+        return "PRODUCTION"
+
+    # Also block if APP_ENV == "production" and target is not explicitly marked demo
+    if APP_ENV == "production" and "demo" not in clean_db_name and clean_db_name != ":memory:":
+        return "PRODUCTION"
+
+    # 2. STRICT DEDICATED DEMO ALLOWLIST
+    # In PostgreSQL:
+    #   - Exact database names: 'jansakshi_demo', 'jansakshi_judge_demo', 'jansakshi_hackathon_demo'
+    #   - Or databases with explicit demo suffix: '_demo' or '-demo' (and host must not be non-demo prod cluster)
+    #   - Or custom allowlisted name from JANSAKSHI_DEMO_DATABASE_NAME
+    # In SQLite:
+    #   - 'jansakshi_demo.db', ':memory:', or filenames containing 'demo' or 'test'
+    #   - 'jansakshi.db' (in non-production development environments)
+    allowed_pg_demo_dbs = {
+        "jansakshi_demo",
+        "jansakshi_judge_demo",
+        "jansakshi_hackathon_demo",
+    }
+    custom_demo_db = os.getenv("JANSAKSHI_DEMO_DATABASE_NAME", "").strip().lower()
+    if custom_demo_db:
+        allowed_pg_demo_dbs.add(custom_demo_db)
+
+    if "postgresql" in driver:
+        if clean_db_name in allowed_pg_demo_dbs or clean_db_name.endswith(("_demo", "-demo")):
+            return "DEMO"
+        return "UNKNOWN"
+
+    if "sqlite" in driver:
+        if (
+            clean_db_name in {":memory:", "jansakshi.db", "jansakshi_demo.db"}
+            or "demo" in clean_db_name
+            or "test" in clean_db_name
+            or clean_db_name.endswith("_demo.db")
+        ):
+            return "DEMO"
+        return "UNKNOWN"
+
+    # 3. UNKNOWN: All other database systems fail closed
+    return "UNKNOWN"
+
 def verify_safe_demo_seed_environment(db: Session, force_allow: bool = False) -> None:
     """
-    Fail-closed safeguard preventing demo seeding against production database environments.
-    Blocks execution if:
-    1. APP_ENV == "production" and force_allow is False.
-    2. Database connection URL / bind points to a production database cluster and force_allow is False.
-    Does not use persistent environment variables for bypass.
-    Requires explicit one-time CLI parameter --force-demo-seed.
+    Fail-closed safeguard preventing demo seeding against production and unauthorized databases.
+    Rules:
+    1. PRODUCTION: Always BLOCKED. No flag (--force-demo-seed) can EVER bypass this.
+    2. UNKNOWN: Always BLOCKED. Unknown database endpoints fail closed.
+    3. DEMO: Requires explicit authorization. If force_allow is False, BLOCKED.
+       If force_allow is True, ALLOWED.
     """
-    is_prod_env = (APP_ENV == "production")
-    db_url_lower = str(DATABASE_URL).lower()
+    target_class = classify_database_target(db)
+    bind = getattr(db, "get_bind", lambda: None)()
+    db_desc = str(getattr(bind, "url", "unknown")) if bind else "unknown"
 
-    # Detect production database connection markers
-    is_prod_db = ("neondb" in db_url_lower and "demo" not in db_url_lower) or ("prod" in db_url_lower and "demo" not in db_url_lower)
-
-    if (is_prod_env or is_prod_db) and not force_allow:
-        raise PermissionError(
-            "FAIL-CLOSED SAFEGUARD: Judge demo seeding is BLOCKED against production environments. "
-            "To prevent accidental contamination of production database records, demo seeding "
-            "can only be run against dedicated demo/development databases. "
-            "To execute for an authorized dedicated demo database, run the seed CLI explicitly with: "
-            "python seed_judge_demo.py --force-demo-seed"
+    if target_class == "PRODUCTION":
+        logger.critical(
+            "CRITICAL SECURITY REJECTION: Seeding permanently blocked against production database (%s). "
+            "--force-demo-seed cannot bypass production protection.", db_desc
         )
+        raise PermissionError(
+            f"FAIL-CLOSED PRODUCTION PROTECTION: Target database '{db_desc}' is identified as the "
+            f"real JanSakshi production database. Demo seeding is PERMANENTLY BLOCKED. "
+            f"The --force-demo-seed flag may only authorize seeding against dedicated demo databases."
+        )
+
+    if target_class == "UNKNOWN":
+        logger.error(
+            "FAIL-CLOSED REJECTION: Database '%s' is not in the dedicated demo allowlist.", db_desc
+        )
+        raise PermissionError(
+            f"FAIL-CLOSED REJECTION: Target database '{db_desc}' is not an authorized judge demo database. "
+            f"Unknown database endpoints fail closed. Seeding is strictly forbidden."
+        )
+
+    if target_class == "DEMO":
+        if not force_allow:
+            logger.warning(
+                "Demo seeding blocked: dedicated demo database '%s' requires explicit --force-demo-seed authorization.", db_desc
+            )
+            raise PermissionError(
+                f"AUTHORIZATION REQUIRED: Target database '{db_desc}' is an authorized demo database, "
+                f"but requires explicit one-time authorization. Run seeder with: "
+                f"python seed_judge_demo.py --force-demo-seed"
+            )
+        logger.info("Demo seeding authorized with --force-demo-seed on dedicated demo database: %s", db_desc)
 
 # Canonical 6 municipal departments
 DEFAULT_DEPARTMENTS = [

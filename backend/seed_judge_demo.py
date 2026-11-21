@@ -21,7 +21,9 @@ def main():
     if "--help" in sys.argv or "-h" in sys.argv:
         print("Usage: python seed_judge_demo.py [--force-demo-seed]")
         print("Options:")
-        print("  --force-demo-seed   Override the fail-closed production safeguard for dedicated demo DB")
+        print("  --force-demo-seed   Explicitly authorize one-time demo seeding against the dedicated demo database")
+        print("\nSafety note: The --force-demo-seed flag may authorize seeding ONLY against dedicated demo databases.")
+        print("It can NEVER bypass protection for the real JanSakshi production database.")
         sys.exit(0)
 
     force_allow = "--force-demo-seed" in sys.argv

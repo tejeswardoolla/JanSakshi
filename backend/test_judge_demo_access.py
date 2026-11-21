@@ -22,6 +22,8 @@ import asyncio
 from unittest.mock import patch, MagicMock
 from fastapi import HTTPException, BackgroundTasks
 
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session
 from app.database import SessionLocal, Base, engine
 from app.models.authority import User, Department
 from app.models.complaint import Complaint
@@ -34,7 +36,11 @@ from app.core.security import (
     require_roles
 )
 from app.core.config import utc_now, is_judge_demo_active, get_judge_demo_expiry
-from app.services.judge_demo_service import seed_judge_demo_data
+from app.services.judge_demo_service import (
+    seed_judge_demo_data,
+    verify_safe_demo_seed_environment,
+    classify_database_target
+)
 from app.routes.auth_routes import (
     login,
     refresh_token_endpoint,
@@ -53,7 +59,7 @@ class TestJudgeDemoAccess(unittest.TestCase):
         Base.metadata.create_all(bind=engine)
         cls.db = SessionLocal()
         # Seed departments and judge demo users
-        seed_judge_demo_data(cls.db)
+        seed_judge_demo_data(cls.db, force_allow=True)
 
         # Ensure standard password users exist for normal login testing
         standard_users = [
@@ -86,6 +92,17 @@ class TestJudgeDemoAccess(unittest.TestCase):
         req = MagicMock()
         req.client.host = ip
         return req
+
+    def _create_mock_session_with_url(self, url_str: str) -> MagicMock:
+        sess = MagicMock(spec=Session)
+        mock_bind = MagicMock()
+        mock_bind.url = make_url(url_str)
+        driver = mock_bind.url.drivername.split("+")[0]
+        mock_bind.dialect.name = driver
+        sess.get_bind.return_value = mock_bind
+        sess.query.return_value.filter.return_value.first.return_value = None
+        sess.query.return_value.all.return_value = []
+        return sess
 
     # -------------------------------------------------------------------------
     # 1. Normal password login remains unchanged
@@ -434,25 +451,73 @@ class TestJudgeDemoAccess(unittest.TestCase):
         self.assertEqual(judge_usernames, {"judge_admin", "judge_officer", "judge_dept"})
 
     # -------------------------------------------------------------------------
-    # 12. Fail-closed production safeguard on demo seeder
+    # 12. Strict production safeguards matrix and database identity classification
     # -------------------------------------------------------------------------
-    def test_12_fail_closed_production_safeguard_on_demo_seeder(self):
+    def test_12_fail_closed_production_safeguards_matrix(self):
         """
-        Verify that demo database seeding fails closed when simulated in APP_ENV=production
-        without explicit force_allow=True. Persistent environment bypass variables are rejected.
+        Verify the complete production-safety matrix for judge demo database seeding:
+        1. Real production database + flag -> BLOCKED.
+        2. Real production database without flag -> BLOCKED.
+        3. Dedicated demo database without flag -> BLOCKED when explicit authorization is required.
+        4. Dedicated demo database + flag -> ALLOWED.
+        5. Unknown database + flag -> BLOCKED.
+        6. Ensure no database writes occur when a safeguard rejects execution.
         """
-        with patch.dict(os.environ, {
-            "APP_ENV": "production"
-        }):
-            with patch("app.services.judge_demo_service.APP_ENV", "production"):
-                with self.assertRaises(PermissionError) as ctx:
-                    seed_judge_demo_data(self.db, force_allow=False)
-                self.assertIn("FAIL-CLOSED SAFEGUARD", str(ctx.exception))
-                self.assertIn("BLOCKED against production environments", str(ctx.exception))
+        prod_url = "postgresql://neondb_owner:super_prod_secret@ep-cool-snowflake-12345.us-east-2.aws.neon.tech/neondb"
+        demo_url = "postgresql://demo_owner:demo_secret@ep-demo-snowflake-12345.us-east-2.aws.neon.tech/jansakshi_demo"
+        unknown_url = "postgresql://random_user:pass@corporate-db.internal/unauthorized_payroll_db"
 
-            # Explicit one-time CLI parameter force_allow=True succeeds
-            res = seed_judge_demo_data(self.db, force_allow=True)
-            self.assertEqual(res["status"], "success")
+        # 1. Real production database + flag -> BLOCKED (flag can NEVER bypass real production!)
+        sess1 = self._create_mock_session_with_url(prod_url)
+        with self.assertRaises(PermissionError) as ctx1:
+            seed_judge_demo_data(sess1, force_allow=True)
+        self.assertIn("FAIL-CLOSED PRODUCTION PROTECTION", str(ctx1.exception))
+        self.assertIn("PERMANENTLY BLOCKED", str(ctx1.exception))
+        self.assertEqual(sess1.add.call_count, 0)
+        self.assertEqual(sess1.commit.call_count, 0)
+
+        # 2. Real production database without flag -> BLOCKED
+        sess2 = self._create_mock_session_with_url(prod_url)
+        with self.assertRaises(PermissionError) as ctx2:
+            seed_judge_demo_data(sess2, force_allow=False)
+        self.assertIn("FAIL-CLOSED PRODUCTION PROTECTION", str(ctx2.exception))
+        self.assertEqual(sess2.add.call_count, 0)
+        self.assertEqual(sess2.commit.call_count, 0)
+
+        # 3. Dedicated demo database without flag -> BLOCKED when explicit authorization is required
+        sess3 = self._create_mock_session_with_url(demo_url)
+        with self.assertRaises(PermissionError) as ctx3:
+            seed_judge_demo_data(sess3, force_allow=False)
+        self.assertIn("AUTHORIZATION REQUIRED", str(ctx3.exception))
+        self.assertIn("--force-demo-seed", str(ctx3.exception))
+        self.assertEqual(sess3.add.call_count, 0)
+        self.assertEqual(sess3.commit.call_count, 0)
+
+        # 4. Dedicated demo database + flag -> ALLOWED
+        sess4 = self._create_mock_session_with_url(demo_url)
+        # Verify safe demo environment approves connection
+        verify_safe_demo_seed_environment(sess4, force_allow=True)
+        self.assertEqual(classify_database_target(sess4), "DEMO")
+        # Live demo database execution with flag succeeds
+        res4 = seed_judge_demo_data(self.db, force_allow=True)
+        self.assertEqual(res4["status"], "success")
+
+        # 5. Unknown database + flag -> BLOCKED (unknown endpoints fail closed)
+        sess5 = self._create_mock_session_with_url(unknown_url)
+        with self.assertRaises(PermissionError) as ctx5:
+            seed_judge_demo_data(sess5, force_allow=True)
+        self.assertIn("FAIL-CLOSED REJECTION", str(ctx5.exception))
+        self.assertIn("not an authorized judge demo database", str(ctx5.exception))
+        self.assertEqual(sess5.add.call_count, 0)
+        self.assertEqual(sess5.commit.call_count, 0)
+
+        # 6. Ensure no database writes occur when a safeguard rejects execution
+        sess_writes = self._create_mock_session_with_url(prod_url)
+        with self.assertRaises(PermissionError):
+            seed_judge_demo_data(sess_writes, force_allow=True)
+        self.assertEqual(sess_writes.add.call_count, 0)
+        self.assertEqual(sess_writes.commit.call_count, 0)
+        self.assertEqual(sess_writes.flush.call_count, 0)
 
     # -------------------------------------------------------------------------
     # 13. Rate limiting enforcement
