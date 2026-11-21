@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.authority import User, RevokedToken
-from app.core.config import utc_now
+from app.core.config import utc_now, is_judge_demo_active
 
 logger = logging.getLogger("jansakshi.security")
 
@@ -209,6 +209,20 @@ def get_user_from_token_str(token: str, db: Session) -> Optional[User]:
     jti = payload.get("jti")
     if jti and is_token_revoked(db, jti):
         return None
+
+    # Enforce judge demo access lifecycle
+    if payload.get("is_judge_demo"):
+        if not is_judge_demo_active():
+            return None
+        token_demo_exp = payload.get("demo_expires_at")
+        if token_demo_exp:
+            try:
+                exp_dt = datetime.datetime.fromisoformat(token_demo_exp.replace("Z", "+00:00"))
+                if utc_now() >= exp_dt:
+                    return None
+            except Exception:
+                return None
+
     username: str = payload.get("sub")
     if username is None:
         return None
@@ -235,6 +249,33 @@ async def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Se
             detail="Session has been revoked or logged out. Please sign in again.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Phase 6: Enforce absolute 10-day judge demo access expiration and server-side disablement
+    if payload.get("is_judge_demo"):
+        if not is_judge_demo_active():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Judge demo access has expired or is disabled. Please contact the administrator.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        token_demo_exp = payload.get("demo_expires_at")
+        if token_demo_exp:
+            try:
+                exp_dt = datetime.datetime.fromisoformat(token_demo_exp.replace("Z", "+00:00"))
+                if utc_now() >= exp_dt:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Judge demo session has expired.",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid judge demo session expiration.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
     
     username: str = payload.get("sub")
     if username is None:

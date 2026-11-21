@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useNavigate, Link, useSearchParams } from 'react-router-dom'
 import {
   Lock, User, ArrowRight, AlertCircle, CheckCircle,
@@ -6,6 +6,7 @@ import {
   Cpu, CheckCircle2, Wrench, Shield, Clock
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
+import { getApiUrl } from '../config/api'
 
 export default function AuthorityLoginPage() {
   const [searchParams] = useSearchParams()
@@ -14,9 +15,32 @@ export default function AuthorityLoginPage() {
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState(null)
-  const [demoExpanded, setDemoExpanded] = useState(false)
-  const { login, loading } = useAuth()
+  const [demoExpanded, setDemoExpanded] = useState(true)
+  const [demoStatus, setDemoStatus] = useState(null)
+  const [demoLoadingRole, setDemoLoadingRole] = useState(null)
+  const { login, loginJudgeDemo, loading } = useAuth()
   const navigate = useNavigate()
+
+  useEffect(() => {
+    let isMounted = true
+    const checkDemoStatus = async () => {
+      try {
+        const res = await fetch(getApiUrl('/api/auth/judge-demo/status'))
+        if (res.ok) {
+          const data = await res.json()
+          if (isMounted) {
+            setDemoStatus(data)
+          }
+        } else {
+          if (isMounted) setDemoStatus({ enabled: false, roles: [] })
+        }
+      } catch (err) {
+        if (isMounted) setDemoStatus({ enabled: false, roles: [] })
+      }
+    }
+    checkDemoStatus()
+    return () => { isMounted = false }
+  }, [])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -41,16 +65,29 @@ export default function AuthorityLoginPage() {
     }
   }
 
-  const fillCredentials = (accountType) => {
-    if (accountType === 'admin') {
-      setUsername('admin')
-    } else if (accountType === 'officer') {
-      setUsername('officer')
-    } else if (accountType === 'dept_demo') {
-      setUsername('dept_demo')
-    }
-    setPassword('')
+  const handleJudgeDemoLogin = async (role) => {
+    if (loading || demoLoadingRole) return
     setError(null)
+    setDemoLoadingRole(role)
+    const result = await loginJudgeDemo(role)
+    setDemoLoadingRole(null)
+    if (result.success) {
+      if (result.user.role === 'department_officer') {
+        const authorized = result.user.authorized_departments || []
+        if (result.user.has_all_departments || authorized.length > 1) {
+          navigate('/authority/select-department')
+        } else {
+          const singleDept = authorized[0] || result.user.department_id || 1
+          localStorage.setItem('jansakshi_active_dept_id', singleDept.toString())
+          localStorage.setItem('jansakshi_active_dept_code', result.user.department_code || 'RPW')
+          navigate(`/authority?dept=${singleDept}`)
+        }
+      } else {
+        navigate('/authority')
+      }
+    } else {
+      setError(result.error || 'Judge demo authentication failed.')
+    }
   }
 
   return (
@@ -264,106 +301,124 @@ export default function AuthorityLoginPage() {
               </button>
             </form>
 
-            {/* Collapsible Hackathon Demo Access (Development Mode Only) */}
-            {import.meta.env.DEV && (
+            {/* Hackathon Judge Demo One-Click Access (Rendered only when backend reports active and unexpired) */}
+            {demoStatus?.enabled && (
               <div className="pt-4 border-t border-white/[0.08]">
                 <button
                   type="button"
                   onClick={() => setDemoExpanded(!demoExpanded)}
                   className="w-full flex items-center justify-between text-xs font-semibold text-[#A1A1AA] hover:text-[#F5F5F5] transition-colors py-1 cursor-pointer"
                 >
-                  <span className="flex items-center gap-1.5 uppercase tracking-wider text-[11px]">
-                    <Sparkles className="w-3.5 h-3.5 text-[#F36B21]" />
-                    Hackathon Demo Access
+                  <span className="flex items-center gap-1.5 uppercase tracking-wider text-[11px] text-[#F36B21]">
+                    <Sparkles className="w-3.5 h-3.5 text-[#F36B21] animate-pulse" />
+                    <span>Hackathon Judge Demo Access</span>
                   </span>
                   {demoExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                 </button>
 
                 {demoExpanded && (
-                  <div className="mt-3 space-y-2">
-                    {/* Option 1: Admin */}
-                    <div
-                      onClick={() => fillCredentials('admin')}
-                      className={`p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between ${
-                        username === 'admin'
-                          ? 'bg-[#191D2A] text-white border-[#F36B21]/50 shadow-sm'
-                          : 'bg-[#10131C] hover:bg-[#191D2A]/60 text-[#A1A1AA] border-white/[0.08]'
-                      }`}
+                  <div className="mt-3 space-y-2.5">
+                    <div className="p-2.5 rounded-xl bg-[#F36B21]/10 border border-[#F36B21]/20 text-[11px] text-[#A1A1AA] flex items-center justify-between">
+                      <span className="flex items-center gap-1.5 text-amber-300">
+                        <Clock className="w-3.5 h-3.5 flex-shrink-0" />
+                        <span>One-click evaluation mode active</span>
+                      </span>
+                      {demoStatus.expires_at && (
+                        <span className="text-[10px] font-mono text-[#A1A1AA]">
+                          Expires: {new Date(demoStatus.expires_at).toLocaleDateString()}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Option 1: Municipal Admin */}
+                    <button
+                      type="button"
+                      disabled={loading || !!demoLoadingRole}
+                      onClick={() => handleJudgeDemoLogin('admin')}
+                      className="w-full p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between bg-[#10131C] hover:bg-[#191D2A] text-[#A1A1AA] hover:text-white border-white/[0.08] hover:border-[#F36B21]/40 disabled:opacity-50"
                     >
                       <div className="flex items-center gap-2.5">
                         <div className="w-8 h-8 rounded-xl bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400 flex-shrink-0">
-                          <Cpu className="w-4 h-4" />
+                          {demoLoadingRole === 'admin' ? (
+                            <div className="w-4 h-4 border-2 border-red-400/30 border-t-red-400 rounded-full animate-spin" />
+                          ) : (
+                            <Cpu className="w-4 h-4" />
+                          )}
                         </div>
                         <div>
                           <div className="text-xs font-bold text-[#F5F5F5] flex items-center gap-1.5">
-                            <span>Admin</span>
-                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white/[0.08] text-[#A1A1AA]">
+                            <span>Municipal Admin</span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-red-500/15 text-red-300 border border-red-500/30">
                               admin
                             </span>
                           </div>
                           <div className="text-[11px] text-[#A1A1AA]">
-                            AI & Complaint Management
+                            AI & Complaint Management, Cross-Citizen Duplicates
                           </div>
                         </div>
                       </div>
-                      {username === 'admin' && <CheckCircle className="w-4 h-4 text-[#F36B21]" />}
-                    </div>
+                      <ArrowRight className="w-4 h-4 text-[#A1A1AA]" />
+                    </button>
 
                     {/* Option 2: Authority Officer */}
-                    <div
-                      onClick={() => fillCredentials('officer')}
-                      className={`p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between ${
-                        username === 'officer'
-                          ? 'bg-[#191D2A] text-white border-[#F36B21]/50 shadow-sm'
-                          : 'bg-[#10131C] hover:bg-[#191D2A]/60 text-[#A1A1AA] border-white/[0.08]'
-                      }`}
+                    <button
+                      type="button"
+                      disabled={loading || !!demoLoadingRole}
+                      onClick={() => handleJudgeDemoLogin('authority_officer')}
+                      className="w-full p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between bg-[#10131C] hover:bg-[#191D2A] text-[#A1A1AA] hover:text-white border-white/[0.08] hover:border-[#F36B21]/40 disabled:opacity-50"
                     >
                       <div className="flex items-center gap-2.5">
                         <div className="w-8 h-8 rounded-xl bg-[#F36B21]/10 border border-[#F36B21]/20 flex items-center justify-center text-[#F36B21] flex-shrink-0">
-                          <CheckCircle2 className="w-4 h-4" />
+                          {demoLoadingRole === 'authority_officer' ? (
+                            <div className="w-4 h-4 border-2 border-[#F36B21]/30 border-t-[#F36B21] rounded-full animate-spin" />
+                          ) : (
+                            <CheckCircle2 className="w-4 h-4" />
+                          )}
                         </div>
                         <div>
                           <div className="text-xs font-bold text-[#F5F5F5] flex items-center gap-1.5">
                             <span>Authority Officer</span>
-                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white/[0.08] text-[#A1A1AA]">
-                              officer
+                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-[#F36B21]/15 text-[#F36B21] border border-[#F36B21]/30">
+                              authority_officer
                             </span>
                           </div>
                           <div className="text-[11px] text-[#A1A1AA]">
-                            Decisions & Department Assignment
+                            Decisions & Department Work-Order Assignment
                           </div>
                         </div>
                       </div>
-                      {username === 'officer' && <CheckCircle className="w-4 h-4 text-[#F36B21]" />}
-                    </div>
+                      <ArrowRight className="w-4 h-4 text-[#A1A1AA]" />
+                    </button>
 
-                    {/* Option 3: Department Officer */}
-                    <div
-                      onClick={() => fillCredentials('dept_demo')}
-                      className={`p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between ${
-                        username === 'dept_demo'
-                          ? 'bg-[#191D2A] text-white border-[#F36B21]/50 shadow-sm'
-                          : 'bg-[#10131C] hover:bg-[#191D2A]/60 text-[#A1A1AA] border-white/[0.08]'
-                      }`}
+                    {/* Option 3: Department Operations */}
+                    <button
+                      type="button"
+                      disabled={loading || !!demoLoadingRole}
+                      onClick={() => handleJudgeDemoLogin('department_officer')}
+                      className="w-full p-3 rounded-2xl border text-left cursor-pointer transition-all flex items-center justify-between bg-[#10131C] hover:bg-[#191D2A] text-[#A1A1AA] hover:text-white border-white/[0.08] hover:border-[#F36B21]/40 disabled:opacity-50"
                     >
                       <div className="flex items-center gap-2.5">
                         <div className="w-8 h-8 rounded-xl bg-sky-500/10 border border-sky-500/20 flex items-center justify-center text-sky-400 flex-shrink-0">
-                          <Wrench className="w-4 h-4" />
+                          {demoLoadingRole === 'department_officer' ? (
+                            <div className="w-4 h-4 border-2 border-sky-400/30 border-t-sky-400 rounded-full animate-spin" />
+                          ) : (
+                            <Wrench className="w-4 h-4" />
+                          )}
                         </div>
                         <div>
                           <div className="text-xs font-bold text-[#F5F5F5] flex items-center gap-1.5">
-                            <span>Department Officer</span>
-                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white/[0.08] text-[#A1A1AA]">
-                              dept_demo
+                            <span>Department Operations</span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
+                              department_officer
                             </span>
                           </div>
                           <div className="text-[11px] text-[#A1A1AA]">
-                            All Six Department Workspaces
+                            Access to All Six Municipal Department Workspaces
                           </div>
                         </div>
                       </div>
-                      {username === 'dept_demo' && <CheckCircle className="w-4 h-4 text-[#F36B21]" />}
-                    </div>
+                      <ArrowRight className="w-4 h-4 text-[#A1A1AA]" />
+                    </button>
                   </div>
                 )}
               </div>

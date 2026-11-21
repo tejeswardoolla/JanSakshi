@@ -1,5 +1,6 @@
 import os
 import datetime
+from typing import Optional
 from dotenv import load_dotenv
 
 # Explicitly load .env file from backend directory if present
@@ -82,3 +83,43 @@ def is_gmail_configured() -> bool:
 def utc_now() -> datetime.datetime:
     """Single source of truth for timezone-aware UTC datetime."""
     return datetime.datetime.now(datetime.timezone.utc)
+
+# -------------------------------------------------------------
+# Hackathon Judge Demo Access Configuration
+# -------------------------------------------------------------
+def get_judge_demo_expiry() -> Optional[datetime.datetime]:
+    """
+    Parses and returns the configured absolute UTC expiry timestamp for judge demo access.
+    Fails closed (returns None) if missing, empty, or unparseable.
+    """
+    raw = os.getenv("JANSAKSHI_JUDGE_DEMO_EXPIRES_AT", "").strip()
+    if not raw:
+        return None
+    try:
+        clean = raw.replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = dt.astimezone(datetime.timezone.utc)
+        return dt
+    except Exception as err:
+        import logging
+        logging.getLogger("jansakshi.config").warning(
+            "Invalid JANSAKSHI_JUDGE_DEMO_EXPIRES_AT timestamp '%s': %s", raw, err
+        )
+        return None
+
+def is_judge_demo_active() -> bool:
+    """
+    Returns True ONLY if judge demo mode is explicitly enabled via environment variable
+    AND a valid absolute UTC expiry timestamp is configured AND current time < expiry.
+    Fails closed otherwise.
+    """
+    enabled = os.getenv("JANSAKSHI_JUDGE_DEMO_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+    if not enabled:
+        return False
+    expiry = get_judge_demo_expiry()
+    if expiry is None:
+        return False
+    return utc_now() < expiry

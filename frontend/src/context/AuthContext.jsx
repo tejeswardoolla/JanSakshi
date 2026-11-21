@@ -4,41 +4,15 @@ import { getApiUrl } from '../config/api'
 const AuthContext = createContext(null)
 
 export function AuthProvider({ children }) {
-  const [token, setToken] = useState(() => {
-    try {
-      const p = new URLSearchParams(window.location.search)
-      const t = p.get('demo_token')
-      if (t) {
-        localStorage.setItem('jansakshi_authority_token', t)
-        return t
-      }
-    } catch (e) {}
-    return localStorage.getItem('jansakshi_authority_token') || null
-  })
-
-  const [refreshToken, setRefreshToken] = useState(() => {
-    try {
-      const p = new URLSearchParams(window.location.search)
-      const rt = p.get('demo_refresh_token')
-      if (rt) {
-        localStorage.setItem('jansakshi_authority_refresh_token', rt)
-        return rt
-      }
-    } catch (e) {}
-    return localStorage.getItem('jansakshi_authority_refresh_token') || null
-  })
-
+  const [token, setToken] = useState(() => localStorage.getItem('jansakshi_authority_token') || null)
+  const [refreshToken, setRefreshToken] = useState(() => localStorage.getItem('jansakshi_authority_refresh_token') || null)
   const [user, setUser] = useState(() => {
     try {
-      const p = new URLSearchParams(window.location.search)
-      const u = p.get('demo_user')
-      if (u) {
-        localStorage.setItem('jansakshi_authority_user', u)
-        return JSON.parse(u)
-      }
-    } catch (e) {}
-    const saved = localStorage.getItem('jansakshi_authority_user')
-    return saved ? JSON.parse(saved) : null
+      const saved = localStorage.getItem('jansakshi_authority_user')
+      return saved ? JSON.parse(saved) : null
+    } catch (e) {
+      return null
+    }
   })
 
   const [loading, setLoading] = useState(false)
@@ -56,6 +30,38 @@ export function AuthProvider({ children }) {
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}))
         throw new Error(errorData.detail || 'Authentication failed. Please verify credentials.')
+      }
+
+      const data = await res.json()
+      setToken(data.access_token)
+      localStorage.setItem('jansakshi_authority_token', data.access_token)
+
+      if (data.refresh_token) {
+        setRefreshToken(data.refresh_token)
+        localStorage.setItem('jansakshi_authority_refresh_token', data.refresh_token)
+      }
+
+      setUser(data.user)
+      localStorage.setItem('jansakshi_authority_user', JSON.stringify(data.user))
+      return { success: true, user: data.user }
+    } catch (err) {
+      return { success: false, error: err.message }
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const loginJudgeDemo = async (role) => {
+    setLoading(true)
+    try {
+      const res = await fetch(getApiUrl(`/api/auth/judge-demo/${role}`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      })
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}))
+        throw new Error(errorData.detail || 'Judge demo authentication failed.')
       }
 
       const data = await res.json()
@@ -174,7 +180,7 @@ export function AuthProvider({ children }) {
   }
 
   return (
-    <AuthContext.Provider value={{ token, refreshToken, user, isAuthenticated: !!token, loading, login, logout, authFetch }}>
+    <AuthContext.Provider value={{ token, refreshToken, user, isAuthenticated: !!token, loading, login, loginJudgeDemo, logout, authFetch }}>
       {children}
     </AuthContext.Provider>
   )
