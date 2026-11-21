@@ -166,7 +166,7 @@ export function AuthProvider({ children }) {
       // If refresh failed or was not possible, perform clean logout and redirect
       await logout()
       if (typeof window !== 'undefined' && window.location.pathname.startsWith('/authority') && !window.location.pathname.includes('/login')) {
-        window.location.href = '/authority/login?session_expired=true'
+        window.location.href = '/authority/login?session_expired=true&quick_access=true'
       }
     }
 
