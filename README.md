@@ -106,9 +106,9 @@ Urban Local Bodies (ULBs) across India manage thousands of citizen grievances we
 
 Given two GPS coordinate pairs $(\text{lat}_1, \text{lon}_1)$ and $(\text{lat}_2, \text{lon}_2)$, spherical coordinates are converted into radians:
 
-$$\phi_1 = \operatorname{radians}(\text{lat}_1), \quad \phi_2 = \operatorname{radians}(\text{lat}_2)$$
+$$\phi_1 = \mathrm{radians}(\text{lat}_1), \quad \phi_2 = \mathrm{radians}(\text{lat}_2)$$
 
-$$\Delta\phi = \operatorname{radians}(\text{lat}_2 - \text{lat}_1), \quad \Delta\lambda = \operatorname{radians}(\text{lon}_2 - \text{lon}_1)$$
+$$\Delta\phi = \mathrm{radians}(\text{lat}_2 - \text{lat}_1), \quad \Delta\lambda = \mathrm{radians}(\text{lon}_2 - \text{lon}_1)$$
 
 The intermediate square half-chord length $a$ is calculated as:
 
@@ -116,7 +116,7 @@ $$a = \sin^2\left(\frac{\Delta\phi}{2}\right) + \cos(\phi_1)\cos(\phi_2)\sin^2\l
 
 To guard against floating-point imprecision exceeding unity, $a$ is clamped to $[0.0, 1.0]$. The angular distance in radians $c$ is computed using the two-argument arctangent:
 
-$$c = 2 \cdot \operatorname{atan2}\left(\sqrt{a}, \sqrt{1 - a}\right)$$
+$$c = 2 \cdot \mathrm{atan2}\left(\sqrt{a}, \sqrt{1 - a}\right)$$
 
 The geodesic surface distance $d$ in metres is:
 
@@ -185,9 +185,9 @@ Relying solely on GPS produces false positives when two completely different pro
 
 #### 1. Text Similarity ($w = 0.30$)
 Combines lexical normalization, civic domain stemming, and three weighted sub-metrics:
-- **Unigram TF Cosine Similarity ($45\%$):** Measures term vector orientation after removing civic stopwords.
-- **Token Overlap Coefficient ($35\%$):** Measures containment: $|S_1 \cap S_2| / \min(|S_1|, |S_2|)$, ensuring brief reports ("pothole here") match detailed descriptions.
-- **Token Jaccard Coefficient ($20\%$):** Evaluates overall vocabulary intersection: $|S_1 \cap S_2| / |S_1 \cup S_2|$.
+- **Unigram TF Cosine Similarity (45%):** Measures term vector orientation after removing civic stopwords.
+- **Token Overlap Coefficient (35%):** Measures containment: $|S_1 \cap S_2| / \min(|S_1|, |S_2|)$, ensuring brief reports ("pothole here") match detailed descriptions.
+- **Token Jaccard Coefficient (20%):** Evaluates overall vocabulary intersection: $|S_1 \cap S_2| / |S_1 \cup S_2|$.
 
 #### 2. Perceptual Image Similarity ($w = 0.25$)
 To detect duplicate photos across varying lighting conditions, camera angles, and mobile resolutions:
