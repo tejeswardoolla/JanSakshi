@@ -93,7 +93,7 @@ class TestJudgeDemoAccess(unittest.TestCase):
         req.client.host = ip
         return req
 
-    def _create_mock_session_with_url(self, url_str: str) -> MagicMock:
+    def _create_mock_session_with_url(self, url_str: str, live_db_return="MATCH_URL") -> MagicMock:
         sess = MagicMock(spec=Session)
         mock_bind = MagicMock()
         mock_bind.url = make_url(url_str)
@@ -102,6 +102,15 @@ class TestJudgeDemoAccess(unittest.TestCase):
         sess.get_bind.return_value = mock_bind
         sess.query.return_value.filter.return_value.first.return_value = None
         sess.query.return_value.all.return_value = []
+
+        if live_db_return == "MATCH_URL":
+            db_val = mock_bind.url.database or ""
+            sess.execute.return_value.scalar.return_value = db_val
+        elif live_db_return == "FAIL":
+            sess.execute.side_effect = Exception("Live database connection query failed")
+        else:
+            sess.execute.return_value.scalar.return_value = live_db_return
+
         return sess
 
     # -------------------------------------------------------------------------
@@ -456,68 +465,83 @@ class TestJudgeDemoAccess(unittest.TestCase):
     def test_12_fail_closed_production_safeguards_matrix(self):
         """
         Verify the complete production-safety matrix for judge demo database seeding:
-        1. Real production database + flag -> BLOCKED.
-        2. Real production database without flag -> BLOCKED.
-        3. Dedicated demo database without flag -> BLOCKED when explicit authorization is required.
-        4. Dedicated demo database + flag -> ALLOWED.
-        5. Unknown database + flag -> BLOCKED.
-        6. Ensure no database writes occur when a safeguard rejects execution.
+        1. Production hostname + database ending in _demo + force flag -> BLOCKED.
+        2. Unknown hostname + approved demo database name + force flag -> BLOCKED.
+        3. Exact approved demo hostname + approved demo database + force flag -> ALLOWED.
+        4. Live current_database() returns neondb despite a demo-looking URL -> BLOCKED.
+        5. Live database identity query fails -> BLOCKED.
+        6. Dedicated demo database without flag -> BLOCKED when authorization required.
+        7. Confirm rejected cases perform zero writes.
         """
-        prod_url = "postgresql://neondb_owner:super_prod_secret@ep-cool-snowflake-12345.us-east-2.aws.neon.tech/neondb"
-        demo_url = "postgresql://demo_owner:demo_secret@ep-demo-snowflake-12345.us-east-2.aws.neon.tech/jansakshi_demo"
-        unknown_url = "postgresql://random_user:pass@corporate-db.internal/unauthorized_payroll_db"
+        prod_host_demo_db = "postgresql://user:pass@ep-cool-snowflake-12345.us-east-2.aws.neon.tech/custom_sub_demo"
+        unknown_host_approved_db = "postgresql://user:pass@unauthorized-host.internal/jansakshi_demo"
+        approved_demo_url = "postgresql://demo_user:pass@ep-demo-snowflake-12345.us-east-2.aws.neon.tech/jansakshi_demo"
 
-        # 1. Real production database + flag -> BLOCKED (flag can NEVER bypass real production!)
-        sess1 = self._create_mock_session_with_url(prod_url)
+        # 1. Production hostname + database ending in _demo + force flag -> BLOCKED
+        sess1 = self._create_mock_session_with_url(prod_host_demo_db)
         with self.assertRaises(PermissionError) as ctx1:
             seed_judge_demo_data(sess1, force_allow=True)
         self.assertIn("FAIL-CLOSED PRODUCTION PROTECTION", str(ctx1.exception))
         self.assertIn("PERMANENTLY BLOCKED", str(ctx1.exception))
         self.assertEqual(sess1.add.call_count, 0)
         self.assertEqual(sess1.commit.call_count, 0)
+        self.assertEqual(sess1.flush.call_count, 0)
 
-        # 2. Real production database without flag -> BLOCKED
-        sess2 = self._create_mock_session_with_url(prod_url)
+        # 2. Unknown hostname + approved demo database name + force flag -> BLOCKED
+        sess2 = self._create_mock_session_with_url(unknown_host_approved_db)
         with self.assertRaises(PermissionError) as ctx2:
-            seed_judge_demo_data(sess2, force_allow=False)
-        self.assertIn("FAIL-CLOSED PRODUCTION PROTECTION", str(ctx2.exception))
+            seed_judge_demo_data(sess2, force_allow=True)
+        self.assertIn("FAIL-CLOSED REJECTION", str(ctx2.exception))
+        self.assertIn("not an authorized judge demo database", str(ctx2.exception))
         self.assertEqual(sess2.add.call_count, 0)
         self.assertEqual(sess2.commit.call_count, 0)
+        self.assertEqual(sess2.flush.call_count, 0)
 
-        # 3. Dedicated demo database without flag -> BLOCKED when explicit authorization is required
-        sess3 = self._create_mock_session_with_url(demo_url)
-        with self.assertRaises(PermissionError) as ctx3:
-            seed_judge_demo_data(sess3, force_allow=False)
-        self.assertIn("AUTHORIZATION REQUIRED", str(ctx3.exception))
-        self.assertIn("--force-demo-seed", str(ctx3.exception))
-        self.assertEqual(sess3.add.call_count, 0)
-        self.assertEqual(sess3.commit.call_count, 0)
+        # 3. Exact approved demo hostname + approved demo database + force flag -> ALLOWED
+        sess3 = self._create_mock_session_with_url(approved_demo_url, live_db_return="jansakshi_demo")
+        verify_safe_demo_seed_environment(sess3, force_allow=True)
+        self.assertEqual(classify_database_target(sess3), "DEMO")
+        # Live demo test execution with force flag succeeds
+        res3 = seed_judge_demo_data(self.db, force_allow=True)
+        self.assertEqual(res3["status"], "success")
 
-        # 4. Dedicated demo database + flag -> ALLOWED
-        sess4 = self._create_mock_session_with_url(demo_url)
-        # Verify safe demo environment approves connection
-        verify_safe_demo_seed_environment(sess4, force_allow=True)
-        self.assertEqual(classify_database_target(sess4), "DEMO")
-        # Live demo database execution with flag succeeds
-        res4 = seed_judge_demo_data(self.db, force_allow=True)
-        self.assertEqual(res4["status"], "success")
+        # 4. Live current_database() returns neondb despite a demo-looking URL -> BLOCKED
+        sess4 = self._create_mock_session_with_url(approved_demo_url, live_db_return="neondb")
+        with self.assertRaises(PermissionError) as ctx4:
+            seed_judge_demo_data(sess4, force_allow=True)
+        self.assertIn("FAIL-CLOSED PRODUCTION PROTECTION", str(ctx4.exception))
+        self.assertIn("neondb", str(ctx4.exception))
+        self.assertEqual(sess4.add.call_count, 0)
+        self.assertEqual(sess4.commit.call_count, 0)
+        self.assertEqual(sess4.flush.call_count, 0)
 
-        # 5. Unknown database + flag -> BLOCKED (unknown endpoints fail closed)
-        sess5 = self._create_mock_session_with_url(unknown_url)
+        # 5. Live database identity query fails -> BLOCKED
+        sess5 = self._create_mock_session_with_url(approved_demo_url, live_db_return="FAIL")
         with self.assertRaises(PermissionError) as ctx5:
             seed_judge_demo_data(sess5, force_allow=True)
-        self.assertIn("FAIL-CLOSED REJECTION", str(ctx5.exception))
-        self.assertIn("not an authorized judge demo database", str(ctx5.exception))
+        self.assertIn("LIVE DATABASE VERIFICATION FAILED", str(ctx5.exception))
         self.assertEqual(sess5.add.call_count, 0)
         self.assertEqual(sess5.commit.call_count, 0)
+        self.assertEqual(sess5.flush.call_count, 0)
 
-        # 6. Ensure no database writes occur when a safeguard rejects execution
-        sess_writes = self._create_mock_session_with_url(prod_url)
-        with self.assertRaises(PermissionError):
-            seed_judge_demo_data(sess_writes, force_allow=True)
-        self.assertEqual(sess_writes.add.call_count, 0)
-        self.assertEqual(sess_writes.commit.call_count, 0)
-        self.assertEqual(sess_writes.flush.call_count, 0)
+        # 6. Dedicated demo database without flag -> BLOCKED when explicit authorization is required
+        sess6 = self._create_mock_session_with_url(approved_demo_url, live_db_return="jansakshi_demo")
+        with self.assertRaises(PermissionError) as ctx6:
+            seed_judge_demo_data(sess6, force_allow=False)
+        self.assertIn("AUTHORIZATION REQUIRED", str(ctx6.exception))
+        self.assertIn("--force-demo-seed", str(ctx6.exception))
+        self.assertEqual(sess6.add.call_count, 0)
+        self.assertEqual(sess6.commit.call_count, 0)
+        self.assertEqual(sess6.flush.call_count, 0)
+
+        # 7. Live database identity differs from configured database -> BLOCKED
+        sess7 = self._create_mock_session_with_url(approved_demo_url, live_db_return="unexpected_other_db")
+        with self.assertRaises(PermissionError) as ctx7:
+            seed_judge_demo_data(sess7, force_allow=True)
+        self.assertIn("DATABASE IDENTITY MISMATCH", str(ctx7.exception))
+        self.assertEqual(sess7.add.call_count, 0)
+        self.assertEqual(sess7.commit.call_count, 0)
+        self.assertEqual(sess7.flush.call_count, 0)
 
     # -------------------------------------------------------------------------
     # 13. Rate limiting enforcement
