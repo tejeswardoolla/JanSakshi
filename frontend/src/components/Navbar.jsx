@@ -91,7 +91,7 @@ export default function Navbar() {
               <ArrowRight size={14} />
             </button>
             <Link
-              to="/authority/login"
+              to="/authority/login?quick_access=true"
               className="flex items-center gap-2 px-3.5 py-2 rounded-full bg-[#102B4E]/90 hover:bg-[#102B4E] border border-[#F36B21]/50 hover:border-[#F36B21] shadow-lg shadow-[#102B4E]/40 text-xs font-semibold text-white/90 hover:text-white transition-all duration-200 group ml-1"
               title="Official Municipal Administration & Command Center"
             >
@@ -124,7 +124,7 @@ export default function Navbar() {
             <ul className="flex flex-col gap-5">
               <li className="pb-1 border-b border-white/10">
                 <button
-                  onClick={() => { setMobileOpen(false); navigate('/authority/login') }}
+                  onClick={() => { setMobileOpen(false); navigate('/authority/login?quick_access=true') }}
                   className="w-full bg-[#102B4E] border border-[#F36B21]/50 text-white font-semibold py-2.5 rounded-xl text-center text-sm flex items-center justify-center gap-2 shadow-md"
                 >
                   <Shield size={16} className="text-[#F36B21]" />
